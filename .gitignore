@@ -1,0 +1,18 @@
+Manifest.toml
+docs/build/
+docs/site/
+*.cov
+*.jl.cov
+*.jl.mem
+.vscode/
+.idea/
+.DS_Store
+deps/deps.jl
+deps/build.log
+deps/downloads/
+deps/usr/
+deps/src/
+
+# Local API key / config — never commit
+.databento/
+config.toml
