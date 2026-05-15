@@ -41,13 +41,49 @@ function get_range(c::Historical;
 end
 
 """
-    foreach_record(f, client::Historical; dataset, schema, symbols, start, end_=nothing,
-                   stype_in=SType.RAW_SYMBOL, stype_out=SType.INSTRUMENT_ID, limit=nothing)
+    record_type_for_schema(schema)
 
-Streaming variant of [`get_range`](@ref). Calls `f(record)` for each `DBN.DBNRecord`
-as it arrives off the wire — overlaps HTTP download with decompress + decode and
-never materialises the compressed payload or the records vector in memory. Use this
-for very large queries where `get_range`'s in-memory buffering would be wasteful.
+Return the concrete `DBN` record struct that a given `Schema` produces. Returns
+`nothing` for schemas that mix record types (e.g. `Schema.MIX`). Used by
+[`foreach_record`](@ref) to enable the zero-allocation type-specific decode path.
+"""
+function record_type_for_schema(schema::Schema.T)
+    schema == Schema.TRADES     && return DBN.TradeMsg
+    schema == Schema.MBO        && return DBN.MBOMsg
+    schema == Schema.MBP_1      && return DBN.MBP1Msg
+    schema == Schema.MBP_10     && return DBN.MBP10Msg
+    schema == Schema.TBBO       && return DBN.MBP1Msg
+    schema == Schema.OHLCV_1S   && return DBN.OHLCVMsg
+    schema == Schema.OHLCV_1M   && return DBN.OHLCVMsg
+    schema == Schema.OHLCV_1H   && return DBN.OHLCVMsg
+    schema == Schema.OHLCV_1D   && return DBN.OHLCVMsg
+    schema == Schema.DEFINITION && return DBN.InstrumentDefMsg
+    schema == Schema.STATISTICS && return DBN.StatMsg
+    schema == Schema.STATUS     && return DBN.StatusMsg
+    schema == Schema.IMBALANCE  && return DBN.ImbalanceMsg
+    schema == Schema.CMBP_1     && return DBN.CMBP1Msg
+    schema == Schema.CBBO_1S    && return DBN.CBBO1sMsg
+    schema == Schema.CBBO_1M    && return DBN.CBBO1mMsg
+    schema == Schema.TCBBO      && return DBN.TCBBOMsg
+    schema == Schema.BBO_1S     && return DBN.BBO1sMsg
+    schema == Schema.BBO_1M     && return DBN.BBO1mMsg
+    return nothing
+end
+
+"""
+    foreach_record(f, client::Historical; dataset, schema, symbols, start, end_=nothing,
+                   stype_in=SType.RAW_SYMBOL, stype_out=SType.INSTRUMENT_ID,
+                   limit=nothing, record_type=nothing)
+
+Streaming variant of [`get_range`](@ref). Calls `f(record)` for each `DBN` record as
+it arrives off the wire — overlaps HTTP download with decompress + decode and never
+materialises the compressed payload or the records vector in memory. Use this for
+very large queries where `get_range`'s in-memory buffering would be wasteful.
+
+By default, the concrete record type is inferred from `schema` (e.g.
+`Schema.TRADES → DBN.TradeMsg`) and the type-specific zero-allocation decode path
+is used (~2× faster than generic dispatch). Pass `record_type = DBN.DBNRecord` to
+force the generic Union-typed path, or `record_type = SomeT` to override.
 
 Returns the `DBN.Metadata` from the response header.
 """
@@ -59,7 +95,8 @@ function foreach_record(f, c::Historical;
                         end_ = nothing,
                         stype_in::SType.T  = SType.RAW_SYMBOL,
                         stype_out::SType.T = SType.INSTRUMENT_ID,
-                        limit::Union{Nothing,Integer} = nothing)::DBN.Metadata
+                        limit::Union{Nothing,Integer} = nothing,
+                        record_type::Union{Nothing,Type} = nothing)::DBN.Metadata
     query = (
         dataset     = String(dataset),
         symbols     = symbols_str(symbols),
@@ -76,16 +113,21 @@ function foreach_record(f, c::Historical;
     for (i, (k, v)) in enumerate(qpairs)
         k == "end_" && (qpairs[i] = "end" => v)
     end
+    T = record_type === nothing ? record_type_for_schema(schema) : record_type
     return open_stream(c.http, hist_path("timeseries.get_range");
                        query = qpairs,
                        accept = "application/octet-stream") do body
         decompressed = TranscodingStream(ZstdDecompressor(), body)
         decoder = DBN.DBNDecoder(decompressed)
         DBN.read_header!(decoder)
-        while true
-            rec = DBN.read_record(decoder)
-            rec === nothing && break
-            f(rec)
+        if T === nothing || T === DBN.DBNRecord
+            while true
+                rec = DBN.read_record(decoder)
+                rec === nothing && break
+                f(rec)
+            end
+        else
+            DBN._foreach_record_impl(f, decoder, T)
         end
         decoder.metadata
     end

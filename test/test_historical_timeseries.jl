@@ -87,3 +87,68 @@ end
     @test !haskey(d, "end_")
     @test occursin("timeseries.get_range", captured[].url)
 end
+
+@testset "record_type_for_schema" begin
+    using DatabentoAPI: record_type_for_schema
+    @test record_type_for_schema(Schema.TRADES)     === DBN.TradeMsg
+    @test record_type_for_schema(Schema.MBO)        === DBN.MBOMsg
+    @test record_type_for_schema(Schema.MBP_1)      === DBN.MBP1Msg
+    @test record_type_for_schema(Schema.MBP_10)     === DBN.MBP10Msg
+    @test record_type_for_schema(Schema.TBBO)       === DBN.MBP1Msg
+    @test record_type_for_schema(Schema.OHLCV_1S)   === DBN.OHLCVMsg
+    @test record_type_for_schema(Schema.OHLCV_1M)   === DBN.OHLCVMsg
+    @test record_type_for_schema(Schema.OHLCV_1H)   === DBN.OHLCVMsg
+    @test record_type_for_schema(Schema.OHLCV_1D)   === DBN.OHLCVMsg
+    @test record_type_for_schema(Schema.DEFINITION) === DBN.InstrumentDefMsg
+    @test record_type_for_schema(Schema.STATISTICS) === DBN.StatMsg
+    @test record_type_for_schema(Schema.STATUS)     === DBN.StatusMsg
+    @test record_type_for_schema(Schema.IMBALANCE)  === DBN.ImbalanceMsg
+    @test record_type_for_schema(Schema.CMBP_1)     === DBN.CMBP1Msg
+    @test record_type_for_schema(Schema.CBBO_1S)    === DBN.CBBO1sMsg
+    @test record_type_for_schema(Schema.CBBO_1M)    === DBN.CBBO1mMsg
+    @test record_type_for_schema(Schema.TCBBO)      === DBN.TCBBOMsg
+    @test record_type_for_schema(Schema.BBO_1S)     === DBN.BBO1sMsg
+    @test record_type_for_schema(Schema.BBO_1M)     === DBN.BBO1mMsg
+    @test record_type_for_schema(Schema.MIX)        === nothing
+end
+
+@testset "foreach_record typed-vs-generic on synthesized stream" begin
+    # Exercise both decode paths against in-memory zstd-DBN bytes (no HTTP).
+    using DatabentoAPI: open_stream  # not used directly, just docs
+    bytes, n = _build_sample_dbn_zstd()
+
+    function decode_typed(bytes)
+        seen = Ref(0); first_type = Ref{Any}(nothing)
+        io = IOBuffer(bytes)
+        decompressed = TranscodingStream(ZstdDecompressor(), io)
+        decoder = DBN.DBNDecoder(decompressed)
+        DBN.read_header!(decoder)
+        DBN._foreach_record_impl(decoder, DBN.TradeMsg) do rec
+            seen[] += 1
+            first_type[] === nothing && (first_type[] = typeof(rec))
+        end
+        return seen[], first_type[]
+    end
+
+    function decode_generic(bytes)
+        seen = Ref(0); first_type = Ref{Any}(nothing)
+        io = IOBuffer(bytes)
+        decompressed = TranscodingStream(ZstdDecompressor(), io)
+        decoder = DBN.DBNDecoder(decompressed)
+        DBN.read_header!(decoder)
+        while true
+            rec = DBN.read_record(decoder)
+            rec === nothing && break
+            seen[] += 1
+            first_type[] === nothing && (first_type[] = typeof(rec))
+        end
+        return seen[], first_type[]
+    end
+
+    n_t, t_t = decode_typed(bytes)
+    n_g, t_g = decode_generic(bytes)
+    @test n_t == n
+    @test n_g == n
+    @test t_t === DBN.TradeMsg
+    @test t_g === DBN.TradeMsg
+end
