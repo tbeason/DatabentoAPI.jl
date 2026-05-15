@@ -277,8 +277,13 @@ end
 
 function _bound_replay(start_ts)
     start_ts === nothing && return nothing
+    ts_ns = if start_ts isa Dates.DateTime
+        Int64(round(Dates.datetime2unix(start_ts) * 1_000_000_000))
+    else
+        Int64(start_ts)
+    end
     now_ns = Int64(round(time() * 1_000_000_000))
-    return max(Int64(start_ts), now_ns - _REPLAY_WINDOW_NS)
+    return max(ts_ns, now_ns - _REPLAY_WINDOW_NS)
 end
 
 function _run_session(ctx::SessionContext;
@@ -515,7 +520,9 @@ function stream_multi_to_files(; schemas::AbstractVector,
                                heartbeat_interval = nothing,
                                slow_reader_behavior = nothing,
                                channel_size::Integer = 10_000,
-                               heartbeat_log_interval_s::Real = 30.0)::Dict{Schema.T,String}
+                               heartbeat_log_interval_s::Real = 30.0,
+                               start::Union{Nothing,Dates.DateTime,Integer} = nothing,
+                               snapshot::Bool = false)::Dict{Schema.T,String}
     isempty(schemas) && throw(ArgumentError("schemas must not be empty"))
     base = base_dir === nothing ? joinpath(pwd(), "live") : String(base_dir)
     sch_vec = Schema.T[s isa Schema.T ? s :
@@ -549,7 +556,7 @@ function stream_multi_to_files(; schemas::AbstractVector,
                 heartbeat_interval = heartbeat_interval,
                 slow_reader_behavior = slow_reader_behavior,
                 channel_size = channel_size,
-                start_initial = nothing, snapshot = false,
+                start_initial = start, snapshot = snapshot,
             )
         catch e
             @error "live worker crashed" schema=sch exception=(e, catch_backtrace())
