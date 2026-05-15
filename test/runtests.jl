@@ -20,6 +20,7 @@ try
         include("test_historical_symbology.jl")
         include("test_live_reader.jl")
         include("test_live_subscribe.jl")
+        include("test_live_streaming.jl")
     end
 catch e
     global offline_failed = true
@@ -31,6 +32,7 @@ if get(ENV, "DATABENTO_LIVE_TESTS", "") == "1"
     @testset "DatabentoAPI live" begin
         include("live/test_historical_smoke.jl")
         include("live/test_live_smoke.jl")
+        include("live/test_live_streaming_smoke.jl")
     end
 end
 

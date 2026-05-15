@@ -29,3 +29,30 @@ function spawn_mock_gateway(script::Function)
     end
     return (; port = Int(port), server, accept_task)
 end
+
+"""
+    spawn_mock_gateway_sequence(scripts::Vector{<:Function})
+
+Spawn a server that accepts one connection per script in turn (in order). Each
+script runs against its own freshly-accepted socket. Useful for testing the
+client's reconnect behaviour.
+"""
+function spawn_mock_gateway_sequence(scripts::Vector)
+    server = Sockets.listen(Sockets.IPv4("127.0.0.1"), 0)
+    port = Sockets.getsockname(server)[2]
+    accept_task = @async begin
+        try
+            for script in scripts
+                sock = Sockets.accept(server)
+                try
+                    script(sock)
+                catch
+                end
+                try; isopen(sock) && Sockets.close(sock); catch; end
+            end
+        finally
+            isopen(server) && Sockets.close(server)
+        end
+    end
+    return (; port = Int(port), server, accept_task)
+end

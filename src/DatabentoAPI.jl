@@ -72,6 +72,7 @@ include("live/client.jl")
 include("live/reader.jl")
 include("live/subscribe.jl")
 include("live/heartbeat.jl")
+include("live/streaming.jl")
 
 # Re-exported DBN.jl enums (single import for users)
 export Schema, SType, Compression, Encoding, Action, Side, InstrumentClass
@@ -103,5 +104,8 @@ export resolve
 
 # Live lifecycle
 export connect!, subscribe!, subscribe_callback, start!, stop!
+
+# Live capture to file
+export stream_to_file, stream_multi_to_files, default_live_path, read_capture
 
 end # module DatabentoAPI
