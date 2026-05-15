@@ -68,6 +68,23 @@ println("got ", length(store), " records")
 df = to_dataframe(store)                  # delegates to DBN.records_to_dataframe
 ```
 
+For very large queries where buffering the entire payload + decoded record vector
+in memory is wasteful, use the streaming variant `foreach_record`. It overlaps the
+HTTP download with decompress + decode and never materialises the full record list:
+
+```julia
+n = 0
+md = foreach_record(client;
+    dataset  = "OPRA.PILLAR", schema = Schema.TRADES, symbols = ["SPY.OPT"],
+    start    = DateTime(2026, 4, 15, 14, 30),
+    end_     = DateTime(2026, 4, 15, 15, 30),
+    stype_in = SType.PARENT) do rec
+    n += 1
+    # process rec on the fly — it's a DBN.TradeMsg / MBP1Msg / etc.
+end
+println("processed ", n, " records, dataset=", md.dataset)
+```
+
 Other endpoints exposed at the package level:
 
 ```
@@ -75,7 +92,7 @@ list_publishers, list_datasets, list_schemas, list_fields,
 list_unit_prices, get_dataset_range, get_dataset_condition,
 get_record_count, get_billable_size, get_cost,
 submit_job, list_jobs, list_files, batch_download,
-resolve
+resolve, foreach_record
 ```
 
 `batch_download` is named to avoid clashing with `Base.download`.

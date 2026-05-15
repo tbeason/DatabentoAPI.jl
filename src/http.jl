@@ -150,3 +150,68 @@ function get_bytes(c::HTTPClient, path::AbstractString;
     resp = request(c, :GET, path; query = query, accept = accept)
     return Vector{UInt8}(resp.body)
 end
+
+"""
+    open_stream(f, c, path; query=nothing, accept="application/octet-stream")
+
+Open a streaming GET against `path` and call `f(io)` with an `IO` that produces the
+response body bytes as they arrive. Status-checking happens before `f` is invoked;
+errors raise `BentoClientError`/`BentoServerError` like the eager `request` path.
+
+The body `IO` is a `Base.BufferStream`; the HTTP download runs in a background task
+that drains the underlying connection into the stream.
+"""
+function open_stream(f, c::HTTPClient, path::AbstractString;
+                     query = nothing,
+                     accept::AbstractString = "application/octet-stream")
+    url = string(c.base_url, path)
+    qpairs = _clean_params(query)
+    headers = [
+        "Authorization" => basic_auth_header(c.api_key),
+        "Accept"        => String(accept),
+        "User-Agent"    => c.user_agent,
+    ]
+    body_stream = Base.BufferStream()
+    err_ref = Ref{Any}(nothing)
+    http_task = @async try
+        HTTP.open(String(uppercase(string("GET"))), url, headers;
+                  query = qpairs,
+                  status_exception = false,
+                  decompress = false,
+                  retry = false,
+                  readtimeout = c.timeout,
+                  connect_timeout = c.connect_timeout) do http
+            HTTP.startread(http)
+            status = http.message.status
+            if status >= 400
+                # Drain body to construct a structured error.
+                buf = IOBuffer()
+                while !eof(http); write(buf, readavailable(http)); end
+                rid = ""
+                for (k, v) in http.message.headers
+                    lowercase(String(k)) == "request-id" && (rid = String(v))
+                end
+                T = status < 500 ? BentoClientError : BentoServerError
+                err_ref[] = http_error_from_response(T, status, String(take!(buf)), rid)
+                return
+            end
+            while !eof(http)
+                write(body_stream, readavailable(http))
+            end
+        end
+    catch e
+        err_ref[] = e
+    finally
+        close(body_stream)
+    end
+    try
+        result = f(body_stream)
+        wait(http_task)
+        err_ref[] === nothing || throw(err_ref[])
+        return result
+    catch
+        # Make sure the HTTP task is allowed to clean up before propagating.
+        try; wait(http_task); catch; end
+        rethrow()
+    end
+end

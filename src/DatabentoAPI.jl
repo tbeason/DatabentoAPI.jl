@@ -94,7 +94,8 @@ export DBNStore, to_dataframe, to_csv, to_json, to_parquet, to_file
 export Historical, Live
 
 # Historical leaf endpoints
-export get_range, list_publishers, list_datasets, list_schemas, list_fields
+export get_range, foreach_record
+export list_publishers, list_datasets, list_schemas, list_fields
 export list_unit_prices, get_dataset_range, get_dataset_condition
 export get_record_count, get_billable_size, get_cost
 export submit_job, list_jobs, list_files, batch_download

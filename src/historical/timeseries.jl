@@ -39,3 +39,54 @@ function get_range(c::Historical;
                       accept = "application/octet-stream")
     return decode_dbn_bytes(bytes; zstd = true)
 end
+
+"""
+    foreach_record(f, client::Historical; dataset, schema, symbols, start, end_=nothing,
+                   stype_in=SType.RAW_SYMBOL, stype_out=SType.INSTRUMENT_ID, limit=nothing)
+
+Streaming variant of [`get_range`](@ref). Calls `f(record)` for each `DBN.DBNRecord`
+as it arrives off the wire — overlaps HTTP download with decompress + decode and
+never materialises the compressed payload or the records vector in memory. Use this
+for very large queries where `get_range`'s in-memory buffering would be wasteful.
+
+Returns the `DBN.Metadata` from the response header.
+"""
+function foreach_record(f, c::Historical;
+                        dataset::AbstractString,
+                        schema::Schema.T,
+                        symbols,
+                        start,
+                        end_ = nothing,
+                        stype_in::SType.T  = SType.RAW_SYMBOL,
+                        stype_out::SType.T = SType.INSTRUMENT_ID,
+                        limit::Union{Nothing,Integer} = nothing)::DBN.Metadata
+    query = (
+        dataset     = String(dataset),
+        symbols     = symbols_str(symbols),
+        schema      = schema_str(schema),
+        stype_in    = stype_str(stype_in),
+        stype_out   = stype_str(stype_out),
+        start       = ts_str(start),
+        end_        = ts_str(end_),
+        limit       = limit,
+        encoding    = "dbn",
+        compression = "zstd",
+    )
+    qpairs = _clean_params(query)
+    for (i, (k, v)) in enumerate(qpairs)
+        k == "end_" && (qpairs[i] = "end" => v)
+    end
+    return open_stream(c.http, hist_path("timeseries.get_range");
+                       query = qpairs,
+                       accept = "application/octet-stream") do body
+        decompressed = TranscodingStream(ZstdDecompressor(), body)
+        decoder = DBN.DBNDecoder(decompressed)
+        DBN.read_header!(decoder)
+        while true
+            rec = DBN.read_record(decoder)
+            rec === nothing && break
+            f(rec)
+        end
+        decoder.metadata
+    end
+end
