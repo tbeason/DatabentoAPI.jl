@@ -389,42 +389,11 @@ end
     read_capture(path) -> (DBN.Metadata, Vector{DBN.DBNRecord})
 
 Decode a `.dbn` or `.dbn.zst` file written by [`stream_to_file`](@ref) /
-[`stream_multi_to_files`](@ref). Equivalent to calling `DBN.read_dbn(path)`,
-but reads the file via an in-memory `IOBuffer` to sidestep a known
-`DBN.BufferedReader` bug that loses bytes straddling its 64 KiB buffer
-boundary on files larger than that.
+[`stream_multi_to_files`](@ref) (or by a Databento batch download). Thin
+wrapper around `DBN.read_dbn_with_metadata` — kept as a convenience export
+so callers don't have to import `DBN` themselves.
 """
-function read_capture(path::AbstractString; skip_metadata::Bool = false)
-    p = String(path)
-    raw = open(read, p)
-    if endswith(p, ".zst")
-        # Use ZstdDecompressorStream so MULTI-FRAME zstd files (Databento batch
-        # downloads use these) are fully decoded.
-        body = read(ZstdDecompressorStream(IOBuffer(raw)))
-    else
-        body = raw
-    end
-    decoder = DBN.DBNDecoder(IOBuffer(body))
-    if skip_metadata
-        # DBN.jl's metadata parser has trouble with some large batch-archive
-        # metadata blocks (likely reserved-padding mismatch). When the caller
-        # only needs the records, jump straight past the metadata header.
-        @assert body[1:3] == b"DBN" "Not a DBN file"
-        meta_len = Int(reinterpret(UInt32, body[5:8])[1])
-        seek(decoder.io, 8 + meta_len)
-        md = nothing
-    else
-        DBN.read_header!(decoder)
-        md = decoder.metadata
-    end
-    records = DBN.DBNRecord[]
-    while true
-        rec = DBN.read_record(decoder)
-        rec === nothing && break
-        push!(records, rec)
-    end
-    return md, records
-end
+read_capture(path::AbstractString) = DBN.read_dbn_with_metadata(String(path))
 
 """
     default_live_path(; dataset, schema, base_dir = joinpath(pwd(), "live"), compress = true)
