@@ -46,16 +46,34 @@ using HTTP
     end
 
     @testset "download writes files to output_dir" begin
+        using SHA
+        # Synthesize two file bodies with sha256 hashes; list_files returns urls
+        # pointing at api.databento.com, and batch_download fetches those URLs
+        # directly (rather than going through /v0/batch.download).
+        body_a = Vector{UInt8}("alpha-content")
+        body_b = Vector{UInt8}("beta-content-longer")
+        hash_a = "sha256:" * bytes2hex(sha256(body_a))
+        hash_b = "sha256:" * bytes2hex(sha256(body_b))
+        url_a  = "https://api.databento.com/v0/batch/download/U/j-1/a.bin"
+        url_b  = "https://api.databento.com/v0/batch/download/U/j-1/b.bin"
+        files_json = """
+        [{"filename":"a.bin","size":$(length(body_a)),"hash":"$(hash_a)",
+          "urls":{"https":"$(url_a)"}},
+         {"filename":"b.bin","size":$(length(body_b)),"hash":"$(hash_b)",
+          "urls":{"https":"$(url_b)"}}]
+        """
         files_called = Ref(false)
+        gets_called  = Ref(0)
         function mock(method, url, headers, body; kwargs...)
             if occursin("batch.list_files", url)
                 files_called[] = true
-                HTTP.Response(200;
-                    body = """[{"filename":"a.bin","size":3},{"filename":"b.bin","size":3}]""")
-            elseif occursin("batch.download", url)
-                qpairs = get(kwargs, :query, [])
-                fname = Dict(qpairs)["filename"]
-                HTTP.Response(200; body = Vector{UInt8}(fname * "!"))
+                HTTP.Response(200; body = files_json)
+            elseif url == url_a
+                gets_called[] += 1
+                HTTP.Response(200; body = body_a)
+            elseif url == url_b
+                gets_called[] += 1
+                HTTP.Response(200; body = body_b)
             else
                 HTTP.Response(500; body = "unexpected url $url")
             end
@@ -64,9 +82,18 @@ using HTTP
         mktempdir() do dir
             paths = batch_download(c; job_id = "j-1", output_dir = dir)
             @test files_called[]
+            @test gets_called[] == 2
             @test length(paths) == 2
             @test all(isfile, paths)
-            @test read(joinpath(dir, "a.bin"), String) == "a.bin!"
+            @test read(joinpath(dir, "a.bin")) == body_a
+            @test read(joinpath(dir, "b.bin")) == body_b
+        end
+        # Idempotent re-download: same size → skip
+        mktempdir() do dir
+            batch_download(c; job_id = "j-1", output_dir = dir)
+            gets_called[] = 0
+            batch_download(c; job_id = "j-1", output_dir = dir)
+            @test gets_called[] == 0
         end
     end
 end

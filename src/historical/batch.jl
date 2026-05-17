@@ -68,22 +68,71 @@ list_files(c::Historical; job_id::AbstractString) =
     get_json(c.http, hist_path("batch.list_files"); query = (; job_id = String(job_id)))
 
 """
-    batch_download(client; job_id, output_dir)
+    batch_download(client; job_id, output_dir, verify_hash=true,
+                   filenames=nothing, overwrite=false)
 
-Download every file for a completed batch job into `output_dir`. Returns the list of
-written file paths. Named `batch_download` to avoid clashing with `Base.download`.
+Download files from a completed batch job into `output_dir`. Returns the list of
+written file paths.
+
+Each file's download URL is taken from `list_files`' `urls.https` field. The
+response also includes the file's sha256 hash; when `verify_hash=true` the
+downloaded bytes are checked against it.
+
+By default every file in the job is downloaded. Pass `filenames` to restrict to a
+subset (matched by exact `filename`). Pass `overwrite=true` to re-download a file
+that's already present and the right size.
+
+Named `batch_download` to avoid clashing with `Base.download`.
 """
 function batch_download(c::Historical;
                         job_id::AbstractString,
-                        output_dir::AbstractString)::Vector{String}
+                        output_dir::AbstractString,
+                        verify_hash::Bool = true,
+                        filenames::Union{Nothing,AbstractVector{<:AbstractString}} = nothing,
+                        overwrite::Bool = false)::Vector{String}
     isdir(output_dir) || mkpath(output_dir)
     files = list_files(c; job_id = String(job_id))
+    want = filenames === nothing ? nothing : Set(String.(filenames))
     out_paths = String[]
     for f in files
         filename = String(f["filename"])
-        bytes = get_bytes(c.http, hist_path("batch.download");
-                          query = (job_id = String(job_id), filename = filename))
+        want === nothing || filename in want || continue
         out = joinpath(String(output_dir), filename)
+        expected_size = Int(f["size"])
+        if !overwrite && isfile(out) && stat(out).size == expected_size
+            push!(out_paths, out)
+            continue
+        end
+        urls = f["urls"]
+        url  = String(urls["https"])
+        # Fetch the file directly; the URL is on a different host (api.databento.com)
+        # but uses the same HTTP basic auth.
+        resp = c.http.dispatcher("GET", url,
+            ["Authorization" => basic_auth_header(c.http.api_key),
+             "Accept"        => "application/octet-stream",
+             "User-Agent"    => c.http.user_agent],
+            UInt8[];
+            status_exception = false,
+            readtimeout      = c.http.timeout,
+            connect_timeout  = c.http.connect_timeout,
+            retry            = false,
+            decompress       = false)
+        if resp.status >= 400
+            T = resp.status < 500 ? BentoClientError : BentoServerError
+            throw(http_error_from_response(T, resp.status,
+                                           String(copy(resp.body)), _request_id(resp)))
+        end
+        bytes = Vector{UInt8}(resp.body)
+        if verify_hash
+            hash_field = String(get(f, "hash", ""))
+            if startswith(hash_field, "sha256:")
+                expected = lowercase(hash_field[8:end])
+                got      = lowercase(bytes2hex(SHA.sha256(bytes)))
+                got == expected ||
+                    throw(ErrorException("sha256 mismatch for $filename: " *
+                                         "expected $expected, got $got"))
+            end
+        end
         open(out, "w") do io
             write(io, bytes)
         end
