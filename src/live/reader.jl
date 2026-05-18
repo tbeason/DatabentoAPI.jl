@@ -90,7 +90,8 @@ function _reader_loop_typed(c::Live)
             hd_result = try
                 DBN.read_record_header(decoder.io)
             catch e
-                if c.closed
+                # See _reader_loop for the EOFError rationale.
+                if c.closed || e isa EOFError
                     break
                 else
                     rethrow(e)
@@ -188,7 +189,11 @@ function _reader_loop_typed(c::Live)
             skip(decoder.io, Int(hd.length) * DBN.LENGTH_MULTIPLIER - 16)
         end
     catch e
-        if !c.closed
+        # EOFError mid-body (e.g. read_trade_msg raises after the header
+        # parsed cleanly because the peer closed during the body read) is
+        # treated as a clean end-of-stream — no "crashed" log. Other
+        # exceptions still surface.
+        if !c.closed && !(e isa EOFError)
             try
                 @error "Live typed reader task crashed" exception=(e, catch_backtrace())
             catch
@@ -238,7 +243,16 @@ function _reader_loop(c::Live)
             rec = try
                 DBN.read_record(decoder)
             catch e
-                if c.closed
+                # Mid-record EOFError can happen on POSIX TCP loopback when the
+                # peer closes after a finite payload and the kernel presents a
+                # short read followed by EOF before all bytes arrive in
+                # userspace. Treat it as clean end-of-stream so the consumer
+                # gets whatever fully-decoded records did arrive instead of an
+                # exception that closes the channel mid-drain. The real
+                # Databento gateway streams continuously without a
+                # finite-payload-then-close pattern, so this branch is
+                # functionally only hit by tests / replay benches.
+                if c.closed || e isa EOFError
                     break
                 else
                     rethrow(e)
@@ -256,7 +270,9 @@ function _reader_loop(c::Live)
             # decide; only EOF on the socket terminates the reader loop.
         end
     catch e
-        if !c.closed
+        # Suppress the "crashed" log on mid-stream EOF (same rationale as
+        # the EOFError handling inside the inner read loop).
+        if !c.closed && !(e isa EOFError)
             try
                 @error "Live reader task crashed" exception=(e, catch_backtrace())
             catch
