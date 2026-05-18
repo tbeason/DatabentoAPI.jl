@@ -6,6 +6,7 @@ docs/site/
 *.jl.mem
 .vscode/
 .idea/
+.claude/
 .DS_Store
 deps/deps.jl
 deps/build.log
