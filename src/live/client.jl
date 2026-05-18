@@ -1,6 +1,6 @@
 """
     Live([key]; dataset, gateway=nothing, port=13000, ts_out=false,
-         heartbeat_interval=nothing, channel_size=10_000)
+         heartbeat_interval=nothing, channel_size=10_000, typed=false)
 
 Client for the Databento Live (TCP) API.
 
@@ -8,6 +8,24 @@ Lifecycle: [`connect!`](@ref) → [`subscribe!`](@ref) (one or more times) → [
 → iterate (`for rec in client`) or [`subscribe_callback`](@ref) → `close(client)`.
 
 A single `Live` is bound to ONE dataset. Multi-dataset workflows need multiple clients.
+
+# Typed mode (`typed = true`)
+
+Under typed mode, each subscribed schema gets its own `Channel{T}` for the
+concrete record type — no per-record Union boxing, type-stable consumer
+code. `subscribe!` returns the typed channel directly; the user owns it
+and reads via `for rec in ch; ...; end`. Control records (`ErrorMsg`,
+`SystemMsg`, `SymbolMappingMsg`) route to a dedicated channel exposed as
+`control_channel(client)`. Iterating `for rec in client` errors under
+typed mode — point users at the per-channel pattern instead.
+
+Typed mode requires every subscribed schema to map to a concrete record
+type (i.e. `DBN.record_type_for_dbn_schema(schema)` returns non-nothing).
+Subscribing to a mixed-record schema like `Schema.MIX` errors at
+`subscribe!`.
+
+Default `typed = false` preserves the original single-`Channel{DBN.DBNRecord}`
+behaviour exactly — no migration needed for existing code.
 """
 mutable struct Live
     api_key::String
@@ -21,7 +39,24 @@ mutable struct Live
     user_agent::String
 
     socket::Union{Nothing,Sockets.TCPSocket}
-    channel::Channel{DBN.DBNRecord}
+
+    # Mode flag — frozen at construction.
+    typed::Bool
+    # `channel_size` retained on the struct so subscribe! can create
+    # per-schema typed channels with the same capacity.
+    channel_size::Int
+
+    # Untyped mode: present (single Union channel); typed mode: nothing.
+    channel::Union{Nothing,Channel{DBN.DBNRecord}}
+
+    # Typed mode: keyed by subscribed schema, values are Channel{ConcreteT}.
+    # Lazily populated by subscribe!; the eltype is concrete per entry but
+    # erased to `Any` at the Dict level (the read/write hot path looks up
+    # by RType into a parallel Dict — see _reader_loop_typed).
+    typed_data_channels::Dict{Schema.T,Any}
+    # Typed mode: ErrorMsg / SystemMsg / SymbolMappingMsg flow here.
+    control_channel::Union{Nothing,Channel{DBN.DBNRecord}}
+
     reader_task::Union{Nothing,Task}
 
     connected::Bool
@@ -43,7 +78,8 @@ function Live(key::Union{Nothing,AbstractString} = nothing;
               heartbeat_interval::Union{Nothing,Integer} = nothing,
               slow_reader_behavior::Union{Nothing,SlowReaderBehavior.T,AbstractString} = nothing,
               channel_size::Integer = 10_000,
-              user_agent::AbstractString = USER_AGENT)
+              user_agent::AbstractString = USER_AGENT,
+              typed::Bool = false)
     api_key = load_api_key(key)
     gw = gateway === nothing ? gateway_for_dataset(dataset) : String(gateway)
     srb = if slow_reader_behavior isa AbstractString
@@ -53,23 +89,51 @@ function Live(key::Union{Nothing,AbstractString} = nothing;
     end
     cmp = compression isa AbstractString ?
           getfield(Compression, Symbol(uppercase(compression))) : compression
+
+    # Channels are built per-mode. Typed mode lazily creates per-schema data
+    # channels in subscribe!; the control channel is constructed up front so
+    # consumers can reach for it before subscribe! is called.
+    untyped_channel = typed ? nothing : Channel{DBN.DBNRecord}(Int(channel_size))
+    control_chan    = typed ? Channel{DBN.DBNRecord}(Int(channel_size)) : nothing
+    typed_chans     = Dict{Schema.T,Any}()
+
     return Live(
         api_key, String(dataset), gw, Int(port), ts_out, cmp,
         heartbeat_interval === nothing ? nothing : Int(heartbeat_interval),
         srb,
         String(user_agent),
-        nothing,
-        Channel{DBN.DBNRecord}(Int(channel_size)),
-        nothing,
+        nothing,                                 # socket
+        typed, Int(channel_size),
+        untyped_channel, typed_chans, control_chan,
+        nothing,                                 # reader_task
         false, false, false,
         nothing, nothing,
         NamedTuple[], 1,
     )
 end
 
-Base.show(io::IO, c::Live) = print(io,
-    "Live(dataset=", c.dataset, ", gateway=", c.gateway, ":", c.port,
-    ", connected=", c.connected, ", started=", c.started, ")")
+function Base.show(io::IO, c::Live)
+    mode = c.typed ? "typed" : "untyped"
+    print(io, "Live(dataset=", c.dataset, ", gateway=", c.gateway, ":", c.port,
+              ", mode=", mode,
+              ", connected=", c.connected, ", started=", c.started, ")")
+end
+
+"""
+    control_channel(client::Live) -> Channel{DBN.DBNRecord}
+
+Return the channel carrying control records (`ErrorMsg`, `SystemMsg`,
+`SymbolMappingMsg`) for a typed-mode `Live`. Errors if the client was
+constructed with `typed = false` (in that mode, control records arrive on
+the main `client.channel` alongside data records).
+"""
+function control_channel(c::Live)
+    c.typed || throw(ArgumentError(
+        "control_channel(client) is only valid for typed-mode Live; " *
+        "in untyped mode, all records (data + control) arrive on client.channel"))
+    c.control_channel === nothing && error("control_channel not initialised")
+    return c.control_channel
+end
 
 """
     connect!(client)
@@ -119,7 +183,9 @@ end
 """
     Base.close(client::Live)
 
-Best-effort close: send `stop` if started, close the socket, close the channel.
+Best-effort close: send `stop` if started, close the socket, close all
+channels (the single Union channel in untyped mode; every typed data
+channel plus the control channel in typed mode).
 """
 function Base.close(c::Live)
     c.closed && return
@@ -137,9 +203,24 @@ function Base.close(c::Live)
         c.socket === nothing || Sockets.close(c.socket)
     catch
     end
+    # Close every channel we own. Each in its own try so a single bad close
+    # doesn't leave others stranded.
     try
-        isopen(c.channel) && close(c.channel)
+        c.channel === nothing || (isopen(c.channel) && close(c.channel))
     catch
+    end
+    if c.typed
+        for ch in values(c.typed_data_channels)
+            try
+                isopen(ch) && close(ch)
+            catch
+            end
+        end
+        try
+            c.control_channel === nothing ||
+                (isopen(c.control_channel) && close(c.control_channel))
+        catch
+        end
     end
     return nothing
 end

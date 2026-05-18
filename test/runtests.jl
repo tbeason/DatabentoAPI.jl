@@ -19,8 +19,10 @@ try
         include("test_historical_batch.jl")
         include("test_historical_symbology.jl")
         include("test_live_reader.jl")
+        include("test_live_reader_typed.jl")
         include("test_live_subscribe.jl")
         include("test_live_streaming.jl")
+        include("test_typed_mode_errors.jl")
     end
 catch e
     global offline_failed = true

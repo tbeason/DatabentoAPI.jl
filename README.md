@@ -125,6 +125,41 @@ sleep(30)
 close(client)
 ```
 
+### Typed-channel variant (`typed = true`)
+
+For high-throughput consumers, opt into per-schema typed channels:
+`subscribe!` returns a `Channel{T}` for the concrete record type instead
+of an `Int` sub_id. Per-record allocation drops ~85% on real OPRA
+streams (see `benchmark/PERF_REPORT.md`).
+
+```julia
+client = Live(dataset = "OPRA.PILLAR", typed = true)
+connect!(client)
+ch_trades = subscribe!(client; schema = Schema.TRADES, symbols = ["SPY.OPT"],
+                       stype_in = SType.PARENT)               # Channel{DBN.TradeMsg}
+ch_cbbo   = subscribe!(client; schema = Schema.CBBO_1S, symbols = ["SPY.OPT"],
+                       stype_in = SType.PARENT)               # Channel{DBN.CBBO1sMsg}
+start!(client)
+
+@async for rec in ch_trades                                    # type-stable: rec :: TradeMsg
+    handle_trade(rec)
+end
+@async for rec in ch_cbbo                                      # type-stable: rec :: CBBO1sMsg
+    handle_quote(rec)
+end
+
+# ErrorMsg / SystemMsg / SymbolMappingMsg arrive on a dedicated channel:
+@async for rec in control_channel(client)
+    rec isa DBN.ErrorMsg && @error "gateway error" rec.err
+end
+```
+
+Caveats:
+- Subscribing to a schema with no concrete record type (e.g. `Schema.MIX`)
+  errors at `subscribe!`.
+- `for rec in client` and `subscribe_callback(client, fn)` are
+  untyped-mode-only; under typed mode iterate each channel directly.
+
 ## Development
 
 ```julia
