@@ -77,11 +77,13 @@ function replay(; path::AbstractString,
                   symbols = ["ALL_SYMBOLS"],
                   stype_in::SType.T = SType.RAW_SYMBOL,
                   channel_size::Integer = 65_536,
-                  log_every::Int = 1_000_000)
+                  log_every::Int = 1_000_000,
+                  typed::Bool = false)
     bytes = read(path)
     println(SUITE, ": replaying ", basename(path),
             " (", round(length(bytes) / (1024*1024), digits = 1), " MB",
-            wire_zstd ? ", wire zstd, expect ~6× expansion)" : ", plain)")
+            wire_zstd ? ", wire zstd, expect ~6× expansion" : ", plain",
+            typed ? ", TYPED mode" : ", untyped mode", ")")
 
     mock = spawn_replay(bytes)
     comp = wire_zstd ? Compression.ZSTD : Compression.NONE
@@ -90,13 +92,17 @@ function replay(; path::AbstractString,
         gateway = "127.0.0.1",
         port = mock.port,
         channel_size = Int(channel_size),
-        compression = comp)
+        compression = comp,
+        typed = typed)
     DatabentoAPI.connect!(client)
-    DatabentoAPI.subscribe!(client;
+    sub_ret = DatabentoAPI.subscribe!(client;
         schema = schema, symbols = symbols, stype_in = stype_in)
     DatabentoAPI.start!(client)
 
-    first_rec = take!(client.channel)
+    # Typed mode: drain the returned Channel{T}. Untyped mode: drain
+    # the Union channel on the client.
+    ch = typed ? sub_ret : client.channel
+    first_rec = take!(ch)
     t0 = time_ns()
     n = 1
     max_depth = 0
@@ -113,14 +119,14 @@ function replay(; path::AbstractString,
     try
         while true
             try
-                _ = take!(client.channel)
+                _ = take!(ch)
                 n += 1
             catch e
                 e isa InvalidStateException && break
                 rethrow()
             end
             if (n & (depth_sample_every - 1)) == 0
-                depth = Base.n_avail(client.channel)
+                depth = Base.n_avail(ch)
                 depth > max_depth && (max_depth = depth)
                 depth >= full_threshold && (depth_full_count += 1)
                 depth_samples += 1

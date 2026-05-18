@@ -233,7 +233,34 @@ function _log_status_alarm!(stats::SessionStats, rec::DBN.StatusMsg, schema::Sch
     return nothing
 end
 
-function _handle_record!(ctx::SessionContext, rec)
+# Data-record path: writes the record to disk + tracks per-instrument
+# replay timestamps. Under typed mode this runs once per record off the
+# typed data channel; the record type is concrete at the call site.
+function _handle_data!(ctx::SessionContext, rec)
+    s = ctx.stats
+    s.data_count    += 1
+    s.last_record_at = time()
+    if hasproperty(rec, :hd) && hasproperty(rec.hd, :instrument_id)
+        iid = rec.hd.instrument_id
+        if hasproperty(rec.hd, :ts_event)
+            s.last_ts_event_by_id[iid] = rec.hd.ts_event
+        end
+        if hasproperty(rec, :ts_recv)
+            s.last_ts_recv_by_id[iid] = rec.ts_recv
+        end
+    end
+    # StatusMsg additionally checks for alarm-worthy state transitions.
+    if rec isa DBN.StatusMsg
+        _log_status_alarm!(s, rec, ctx.schema)
+    end
+    _write_record!(ctx.file, rec)
+    return nothing
+end
+
+# Control-record path: SymbolMappingMsg / SystemMsg / ErrorMsg.
+# Counts + special handling per type. Never written to disk (mappings
+# break round-trip due to v1/v3 layout drift; system/error are noise).
+function _handle_control!(ctx::SessionContext, rec)
     s = ctx.stats
     if rec isa DBN.SymbolMappingMsg
         # Don't write SymbolMappingMsg to disk: live gateway sends v1-layout
@@ -246,29 +273,23 @@ function _handle_record!(ctx::SessionContext, rec)
     elseif rec isa DBN.SystemMsg
         s.system_count += 1
         is_heartbeat(rec) || @debug "SystemMsg" schema=ctx.schema msg=rec.msg
-        # Don't write SystemMsg to disk — heartbeats / status text are noise.
     elseif rec isa DBN.ErrorMsg
         s.error = String(rec.err)
         @error "gateway ErrorMsg (terminal)" schema=ctx.schema err=s.error
-        # Don't write; let the channel close naturally and the session loop exit.
-    elseif rec isa DBN.StatusMsg
-        s.data_count    += 1
-        s.last_record_at = time()
-        _log_status_alarm!(s, rec, ctx.schema)
-        _write_record!(ctx.file, rec)
+        # Caller's main loop checks ctx.stats.error and exits without reconnect.
+    end
+    return nothing
+end
+
+# Untyped-mode fallback (kept as a backward-compat dispatcher in case any
+# external caller depends on the unified-channel _handle_record! path).
+function _handle_record!(ctx::SessionContext, rec)
+    if rec isa DBN.SymbolMappingMsg ||
+       rec isa DBN.SystemMsg ||
+       rec isa DBN.ErrorMsg
+        _handle_control!(ctx, rec)
     else
-        s.data_count    += 1
-        s.last_record_at = time()
-        if hasproperty(rec, :hd) && hasproperty(rec.hd, :instrument_id)
-            iid = rec.hd.instrument_id
-            if hasproperty(rec.hd, :ts_event)
-                s.last_ts_event_by_id[iid] = rec.hd.ts_event
-            end
-            if hasproperty(rec, :ts_recv)
-                s.last_ts_recv_by_id[iid] = rec.ts_recv
-            end
-        end
-        _write_record!(ctx.file, rec)
+        _handle_data!(ctx, rec)
     end
     return nothing
 end
@@ -306,6 +327,11 @@ function _run_session(ctx::SessionContext;
                                                _replay_start_ts(ctx.stats, ctx.schema)
         start_ts = _bound_replay(start_ts)
 
+        # typed=true: the reader splits data records (concrete type, typed
+        # Channel{T}) from control records (Union, control_channel). Two
+        # consumer paths inside this iteration of the reconnect loop:
+        #   - main loop drains `data_ch` and writes records to file
+        #   - a control-drainer task drains control_channel and updates stats
         client = Live(key;
             dataset = String(dataset),
             gateway = gateway, port = port,
@@ -314,21 +340,51 @@ function _run_session(ctx::SessionContext;
             heartbeat_interval = heartbeat_interval,
             slow_reader_behavior = slow_reader_behavior,
             channel_size = channel_size,
+            typed = true,
         )
         ctx.current_client = client
+        ctrl_drainer::Union{Nothing,Task} = nothing
         try
             connect!(client)
-            subscribe!(client; schema = ctx.schema, symbols = symbols,
-                       stype_in = stype_in, snapshot = snapshot, start = start_ts)
+            data_ch = subscribe!(client;
+                schema = ctx.schema, symbols = symbols,
+                stype_in = stype_in, snapshot = snapshot, start = start_ts)
             start!(client)
 
-            for rec in client
-                _handle_record!(ctx, rec)
-                ctx.shutdown_requested[] && break
-                deadline !== nothing && time() >= deadline && break
-                while isready(ctx.flush_request)
-                    try; take!(ctx.flush_request); catch; end
-                    _flush!(ctx.file)
+            ctrl_drainer = @async begin
+                try
+                    for rec in control_channel(client)
+                        _handle_control!(ctx, rec)
+                    end
+                catch e
+                    if !(e isa InvalidStateException) && !ctx.shutdown_requested[]
+                        @warn "control drainer error" schema=ctx.schema exception=(e, catch_backtrace())
+                    end
+                end
+            end
+
+            try
+                while true
+                    rec = try
+                        take!(data_ch)
+                    catch e
+                        e isa InvalidStateException && break
+                        rethrow()
+                    end
+                    _handle_data!(ctx, rec)
+                    ctx.shutdown_requested[] && break
+                    deadline !== nothing && time() >= deadline && break
+                    # Bail fast if the control drainer flagged a terminal
+                    # ErrorMsg — no point reading more data records.
+                    ctx.stats.error !== nothing && break
+                    while isready(ctx.flush_request)
+                        try; take!(ctx.flush_request); catch; end
+                        _flush!(ctx.file)
+                    end
+                end
+            catch e
+                if !(e isa InvalidStateException) && !ctx.shutdown_requested[]
+                    @warn "live session error" schema=ctx.schema exception=(e, catch_backtrace())
                 end
             end
         catch e
@@ -338,6 +394,9 @@ function _run_session(ctx::SessionContext;
         finally
             ctx.current_client = nothing
             try; close(client); catch; end
+            # Closing the client closes the control channel; wait for the
+            # drainer to drain in-flight records and exit cleanly.
+            ctrl_drainer === nothing || (try; wait(ctrl_drainer); catch; end)
         end
 
         ctx.shutdown_requested[]                         && return

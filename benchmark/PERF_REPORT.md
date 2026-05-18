@@ -22,6 +22,7 @@ Each row is the minimum of N BenchmarkTools samples (`samples=5` for read, `samp
 | R5 — `stream_to_file` default `compress_level = 1` | **DONE** | Default changed in `src/live/streaming.jl`. Bench-derived rationale (L1 ≈ 35% faster than L3 at write boundary) captured in the docstring. New explicit-override test added. |
 | R6 — document `DBNStream` per-record alloc cost   | **DONE** | "Performance" note added to `DBN.jl/src/streaming.jl` `DBNStream` docstring + README pointer to `foreach_record`. |
 | R7 — bench-internal note                          | **DROPPED** | Not a code change. |
+| F1b — typed live channels                         | **DONE**    | `Live(...; typed=true)` opts in. `subscribe!` returns `Channel{T}`; control records route to `control_channel(client)`. `stream_to_file` / `stream_multi_to_files` migrated to use typed Live. **−85% allocation** on the real OPRA CMBP-1 replay; throughput roughly neutral (record-size dependent). See "F1b" in Future Work section. |
 
 **Test deltas:** DatabentoAPI.jl 188 → 200 tests (+12 covering R1 type assertions, R1 typed=false escape hatch, R5 explicit override, F4 size_hint). DBN.jl test suite: same pass count; pre-existing 10 errors in `test_phase10_complete.jl` (missing `using DataFrames` for `nrow`/`ncol`) are unrelated to this pass.
 
@@ -335,6 +336,75 @@ R1+R2 collapsed all 80%+ GC paths to 0%. The remaining warm GC is in `DBNStream`
 ## Future work
 
 Status: each item below has been triaged after the implementation pass. Concrete design sketches are given where the next step is non-trivial.
+
+### F1b — Live reader typed-channel fast path  **[DONE]**
+
+Implemented on `feat/typed-live-channels`. `Live(...; typed = true)` opts the
+client into per-schema typed channels. `subscribe!` returns `Channel{T}`
+(concrete record type) instead of an `Int` sub_id. Control records
+(`ErrorMsg`, `SystemMsg`, `SymbolMappingMsg`) route to a dedicated
+`control_channel(client)`. `stream_to_file` and `stream_multi_to_files`
+migrated to use typed Live internally.
+
+DBN.jl gained `foreach_record_with_control(f_data, f_control, file_or_decoder, T)`
+plus `_type_to_rtype_stream` / `_read_typed_record_stream` / `record_type_for_dbn_schema`
+overloads for the previously-untyped schemas (`STATISTICS`, `CMBP_1`,
+`CBBO_1S/M`, `TCBBO`, `BBO_1S/M`, `TBBO`).
+
+**Measured (`bench_live_replay` against the real OPRA SPY.OPT CMBP-1
+archive, 7.72 M records, 206 MB wire)**:
+
+| Mode | Drain rate | Alloc | GC% | Channel peak |
+|---|---|---|---|---|
+| Untyped (Union channel) | 2.95 M rec/s | 37.3 MB | 10.7% | 99.8% |
+| Typed (`Channel{CMBP1Msg}` + control channel) | 2.77 M rec/s | **5.5 MB (−85%)** | 10.1% | 99.8% |
+
+The big alloc win materialised as predicted. Wall-time delta was small and
+slightly negative (−6%) on this workload — the in-process bench's +23%
+projection was for `TradeMsg` (48 bytes), but `CMBP1Msg` is larger (~80 bytes),
+so the typed channel's inline value copy costs more per put!/take! than the
+Union channel's pointer move. The net is alloc-positive, throughput-neutral
+on this record size. For smaller records (TradeMsg, MBP1Msg) we'd expect
+the throughput to flip positive too.
+
+`bench_live_reader` (synthetic 100 k TradeMsg, channel saturated):
+
+| Mode | Drain rate | Alloc |
+|---|---|---|
+| live_plain         | 8.0 M rec/s | 8.6 MB |
+| live_plain_typed   | 7.1 M rec/s | 11.9 MB |
+| live_zstd          | 5.7 M rec/s | 6.4 MB |
+| live_zstd_typed    | 6.4 M rec/s | 7.5 MB |
+
+Small synthetic fixtures show channel-construction overhead (typed mode
+builds a second channel for control records) dominating; the
+per-record win is masked. The real-OPRA replay above is the load-bearing
+measurement.
+
+Architecture notes for callers and reviewers:
+
+- **Multi-schema on one Live is supported**: subscribe to N schemas, get N
+  typed channels; each is independently drained (one consumer task per
+  channel is the natural shape).
+- **Reconnect**: `_run_session` in streaming.jl rebuilds the Live on TCP
+  drop. The `SessionContext` holds the channel references, so the new
+  Live's channels are wired into the same consumer paths (per phase plan).
+- **Iteration**: `for rec in client` errors under typed mode with a
+  message pointing at the per-channel iteration pattern.
+- **`subscribe_callback`** is untyped-mode-only; for typed mode use
+  `@async for rec in subscribed_channel; fn(rec); end`.
+- **Schemas without a concrete record type** (`Schema.MIX`) error at
+  `subscribe!` under typed mode.
+
+Test coverage: 225 offline tests (was 200 pre-pass; +25 covering Phase 11
+DBN.jl helpers, typed reader mock round-trip, multi-schema typed, all
+error paths, control-channel routing).
+
+### F1 — superseded by F1b above
+
+Earlier draft considered a halfway version (typed read, Union channel) that
+would have saved CPU only. F1b lands the full version — typed read + typed
+channel + dedicated control channel.
 
 ### F1 — Live reader typed-loop fast path  (was R3 follow-up; now opportunistic)
 

@@ -1,9 +1,18 @@
 """
     subscribe!(client; schema, symbols, stype_in=SType.RAW_SYMBOL,
-               snapshot=false, start=nothing) -> Int
+               snapshot=false, start=nothing) -> Int | Channel{T}
 
 Send a subscription request to the Live gateway. May be called multiple times before
-[`start!`](@ref). Returns the subscription id.
+[`start!`](@ref).
+
+Return type depends on the client's mode:
+- **Untyped** (`Live(...; typed=false)`, the default): returns an `Int` sub_id.
+  All records flow into the single `client.channel :: Channel{DBN.DBNRecord}`.
+- **Typed** (`Live(...; typed=true)`): returns the `Channel{T}` for the
+  concrete record type bound to this schema. Multiple subscribes to the
+  same schema (different symbols) share one channel — records of the same
+  type land together. Subscribing under typed mode to a schema with no
+  concrete record type (e.g. `Schema.MIX`) errors.
 
 `snapshot=true` (request an order book snapshot) is mutually exclusive with `start`.
 """
@@ -17,6 +26,18 @@ function subscribe!(c::Live;
     c.started   && throw(ArgumentError("cannot subscribe after start!"))
     snapshot && start !== nothing &&
         throw(ArgumentError("snapshot=true and start are mutually exclusive"))
+
+    # Typed mode requires every subscribed schema to have a concrete record
+    # type. Validate up front so the user sees a clear error at subscribe!
+    # instead of at start! or later.
+    typed_T = nothing
+    if c.typed
+        typed_T = DBN.record_type_for_dbn_schema(schema)
+        typed_T === nothing && throw(ArgumentError(
+            "typed mode requires schema $(schema) to have a concrete record " *
+            "type, but DBN.record_type_for_dbn_schema returned nothing. " *
+            "Use Live(...; typed=false) for this schema."))
+    end
 
     sub_id = c.next_sub_id
     c.next_sub_id += 1
@@ -38,14 +59,42 @@ function subscribe!(c::Live;
 
     push!(c.subscriptions, (id = sub_id, schema = schema, symbols = syms,
                             stype_in = stype_in, snapshot = snapshot, start = start_ns))
+
+    if c.typed
+        # Reuse the existing channel if this schema has already been subscribed
+        # to; otherwise create a fresh Channel{T}.
+        if haskey(c.typed_data_channels, schema)
+            return c.typed_data_channels[schema]
+        else
+            ch = Channel{typed_T}(c.channel_size)
+            c.typed_data_channels[schema] = ch
+            return ch
+        end
+    end
     return sub_id
+end
+
+"""
+    channel(client::Live, schema::Schema.T) -> Channel{T}
+
+Return the typed data channel for the given subscribed schema. Errors if
+the client is untyped or if the schema has not been subscribed.
+"""
+function channel(c::Live, schema::Schema.T)
+    c.typed || throw(ArgumentError(
+        "channel(client, schema) is only valid for typed-mode Live; " *
+        "in untyped mode, use client.channel"))
+    haskey(c.typed_data_channels, schema) ||
+        throw(KeyError("no subscription for schema $(schema) on this Live"))
+    return c.typed_data_channels[schema]
 end
 
 """
     start!(client)
 
-Tell the gateway to begin streaming. After this returns, records flow into the client's
-internal channel and can be consumed via iteration or [`subscribe_callback`](@ref).
+Tell the gateway to begin streaming. After this returns, records flow into
+the client's channel(s) and can be consumed via iteration or
+[`subscribe_callback`](@ref).
 """
 function start!(c::Live)
     c.connected || throw(ArgumentError("call connect!(client) before start!"))
@@ -55,8 +104,18 @@ function start!(c::Live)
 
     write_text_frame(c.socket; start_session = 0)
 
-    c.reader_task = @async _reader_loop(c)
-    bind(c.channel, c.reader_task)
+    if c.typed
+        c.reader_task = @async _reader_loop_typed(c)
+        # Bind each typed data channel + the control channel to the reader
+        # task so they auto-close when the reader exits.
+        for ch in values(c.typed_data_channels)
+            bind(ch, c.reader_task)
+        end
+        bind(c.control_channel, c.reader_task)
+    else
+        c.reader_task = @async _reader_loop(c)
+        bind(c.channel, c.reader_task)
+    end
     c.started = true
     return c
 end
@@ -86,6 +145,10 @@ Base.eltype(::Type{Live}) = DBN.DBNRecord
 
 function Base.iterate(c::Live, state = nothing)
     c.started || throw(ArgumentError("call start!(client) before iterating"))
+    c.typed && throw(ArgumentError(
+        "iterating `for rec in client` is not supported in typed mode. " *
+        "Iterate each subscribed channel directly (the value returned by " *
+        "subscribe!), or use channel(client, schema)."))
     try
         rec = take!(c.channel)
         return (rec, nothing)
@@ -102,9 +165,20 @@ end
 
 Spawn a task that pulls every record from `client` and passes it to `fn(record)`.
 Returns the task. Use this for low-overhead event-driven loops; otherwise iterate.
+
+Untyped mode only. For typed mode, register one task per subscribed
+channel directly:
+
+```julia
+ch = subscribe!(client; schema = Schema.TRADES, symbols = ...)
+@async for rec in ch; fn(rec); end
+```
 """
 function subscribe_callback(c::Live, fn)
     c.started || throw(ArgumentError("call start!(client) before subscribe_callback"))
+    c.typed && throw(ArgumentError(
+        "subscribe_callback(client, fn) is not supported in typed mode. " *
+        "Spawn one @async task per subscribed channel instead."))
     return @async try
         for rec in c
             fn(rec)

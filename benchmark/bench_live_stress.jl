@@ -25,26 +25,59 @@ function run(; duration_s::Real = 60.0,
               channel_size::Integer = 65_536,
               parents = DEFAULT_PARENTS,
               schema::Schema.T = Schema.CMBP_1,
-              wire_zstd::Bool = true)
+              wire_zstd::Bool = true,
+              typed::Bool = false)
     println("live stress: dataset=OPRA.PILLAR schema=", schema,
-            "  parents=", length(parents), "  duration=", duration_s, "s")
+            "  parents=", length(parents), "  duration=", duration_s, "s",
+            typed ? "  mode=TYPED" : "  mode=untyped")
 
     client = DatabentoAPI.Live(;
         dataset = "OPRA.PILLAR",
         compression = wire_zstd ? Compression.ZSTD : Compression.NONE,
         slow_reader_behavior = SlowReaderBehavior.WARN,
-        channel_size = Int(channel_size))
+        channel_size = Int(channel_size),
+        typed = typed)
     DatabentoAPI.connect!(client)
     println("  connected  session_id=", client.session_id)
 
-    DatabentoAPI.subscribe!(client;
+    sub_ret = DatabentoAPI.subscribe!(client;
         schema = schema, symbols = parents, stype_in = SType.PARENT)
     DatabentoAPI.start!(client)
     println("  started")
 
-    # Wait for first record (handshake + first arrival latency excluded
-    # from the measurement window).
-    first_rec = take!(client.channel)
+    # In typed mode, drain the schema's typed data channel and the control
+    # channel separately. In untyped mode, the single Union channel
+    # carries both.
+    data_ch = typed ? sub_ret : client.channel
+    ctrl_consumer::Union{Nothing,Task} = nothing
+    n_control_typed = Ref(0)
+    n_smap_typed = Ref(0)
+    n_system_typed = Ref(0)
+    n_error_typed = Ref(0)
+    err_samples_typed = String[]
+    if typed
+        ctrl = DatabentoAPI.control_channel(client)
+        ctrl_consumer = @async begin
+            try
+                for rec in ctrl
+                    n_control_typed[] += 1
+                    if rec isa DBN.SymbolMappingMsg
+                        n_smap_typed[] += 1
+                    elseif rec isa DBN.SystemMsg
+                        n_system_typed[] += 1
+                    elseif rec isa DBN.ErrorMsg
+                        n_error_typed[] += 1
+                        length(err_samples_typed) < 5 && push!(err_samples_typed, String(rec.err))
+                    end
+                end
+            catch e
+                e isa InvalidStateException || rethrow()
+            end
+        end
+    end
+
+    # Wait for first record on the data channel.
+    first_rec = take!(data_ch)
     println("  first record:  ", typeof(first_rec))
 
     # Warmup drain (excluded from rate calculation).
@@ -52,7 +85,7 @@ function run(; duration_s::Real = 60.0,
     warmup_until = time() + warmup_s
     while time() < warmup_until
         try
-            _ = take!(client.channel); n_warmup += 1
+            _ = take!(data_ch); n_warmup += 1
         catch e
             e isa InvalidStateException && break
             rethrow()
@@ -85,16 +118,20 @@ function run(; duration_s::Real = 60.0,
     try
         while time() < deadline
             rec = try
-                take!(client.channel)
+                take!(data_ch)
             catch e
                 e isa InvalidStateException && break
                 rethrow()
             end
             n += 1
-            if rec isa DBN.ErrorMsg
+            # Under typed mode, data_ch only carries data records (control
+            # goes through ctrl_consumer above); under untyped mode we
+            # classify here.
+            if typed
+                n_data += 1
+            elseif rec isa DBN.ErrorMsg
                 n_error += 1
                 txt = String(rec.err)
-                # Code-7 is SkippedRecordsAfterSlowReading.
                 if hasproperty(rec, :code) && UInt8(rec.code) == 0x07
                     n_skipped_err += 1
                 elseif occursin("skipped", lowercase(txt)) ||
@@ -111,7 +148,7 @@ function run(; duration_s::Real = 60.0,
             end
 
             if (n & (depth_sample_every - 1)) == 0
-                d = Base.n_avail(client.channel)
+                d = Base.n_avail(data_ch)
                 d > max_depth && (max_depth = d)
                 depth_samples += 1
             end
@@ -134,6 +171,17 @@ function run(; duration_s::Real = 60.0,
 
         try; DatabentoAPI.stop!(client); catch; end
         try; close(client); catch; end
+        # Drain control consumer (typed mode).
+        if ctrl_consumer !== nothing
+            try; wait(ctrl_consumer); catch; end
+            # Merge typed control counts back in for the summary.
+            n_symbol_mapping = n_smap_typed[]
+            n_system        = n_system_typed[]
+            n_error         = n_error_typed[]
+            for s in err_samples_typed
+                length(err_samples) < 5 && push!(err_samples, s)
+            end
+        end
 
         println()
         println("=== live stress summary ===")
