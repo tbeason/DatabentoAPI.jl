@@ -199,6 +199,41 @@ All four wire×file compression configurations land at the same ~2150 ms ceiling
 | zstd  | plain | 2.17 s | 38 MB |
 | zstd  | zstd  | 2.16 s | 38 MB |
 
+### Live-network stress against the real Databento gateway
+
+`benchmark/bench_live_stress.jl` hits the actual OPRA Live gateway with
+`slow_reader_behavior = WARN` so the gateway emits a code-7 ErrorMsg every
+time it drops records on our behalf. **Run 2026-05-18 ~14:00 UTC** (busy
+morning session), 60 s window, 10 parents:
+`SPX.OPT, SPXW.OPT, SPY.OPT, QQQ.OPT, VIX.OPT, NDX.OPT, NDXP.OPT, NVDA.OPT,
+TSLA.OPT, MSTR.OPT`, channel_size = 65 536, wire zstd.
+
+| Metric | Value |
+|---|---|
+| Records consumed              | 17 278 566 in 60.0 s |
+| **Sustained rate**            | **288 k rec/s** (281–308 k/s per 10-s window) |
+| SkippedRecords ErrorMsgs      | **0** |
+| Peak channel depth            | 50 789 / 65 536 (77.5%) |
+| GC fraction                   | 0.6% |
+| Per-record allocation         | ~0 bytes/rec (1.5 MB total) |
+
+**The reader is sitting at ~10% of its ceiling.** The 3.0 M rec/s ceiling
+measured by the replay bench is real but not exercised: the gateway + wire
+deliver this subscription at 288 k rec/s, well within headroom. Channel
+hits 77% during bursts but never saturates, so we're not even on the edge.
+
+**Bandwidth sanity check.** 288 k rec/s × ~80 bytes/CMBP1Msg ≈ 23 MB/s
+decompressed → ~4 MB/s on the wire after zstd → ~30 Mbps, about 3% of the
+1 Gbps fiber. These 10 names include the busiest options in the market;
+going to ALL_SYMBOLS would multiply this rate ~30× and saturate the wire
+long before saturating the pipeline.
+
+**GC scales with sustained allocation rate, not record count.** Replay at
+LAN speed: 10.5% GC. Real-network at 1/10 the rate: 0.6%. The Union-channel
+allocation pressure that F1b would address is only load-bearing if your
+arrival rate is in the multi-million-records-per-second range — which
+requires a fatter pipe than 1 Gbps for OPRA.
+
 ---
 
 ## Bottleneck analysis (from `profile_hotspots`, medium tier, 5 s window)
