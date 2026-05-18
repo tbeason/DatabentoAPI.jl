@@ -16,3 +16,7 @@ deps/src/
 # Local API key / config — never commit
 .databento/
 config.toml
+
+# Benchmark artifacts
+benchmark/results/
+benchmark/data/

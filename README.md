@@ -144,6 +144,16 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 
 The Live smoke test defaults to `OPRA.PILLAR`. Override with `DATABENTO_LIVE_DATASET`, `DATABENTO_LIVE_SYMBOLS`, `DATABENTO_LIVE_STYPE`. The Historical smoke test honours `DATABENTO_HIST_DATASET`, `DATABENTO_HIST_SYMBOLS`, `DATABENTO_HIST_START`, `DATABENTO_HIST_END`.
 
+## Benchmarks
+
+See `benchmark/` for the offline performance suite (`julia --project=benchmark benchmark/runbench.jl`) and `benchmark/PERF_REPORT.md` for the current baseline numbers and recommendations.
+
+For high-throughput iteration over historical data, prefer
+`DatabentoAPI.foreach_record(client; ...)` or `DBN.foreach_record(file, T)`
+over `DBNStore` indexing or `DBNStream`: the typed-callback path has
+near-zero per-record allocation (~0.13 bytes/record), while the Union-typed
+iterator paths allocate ~120 bytes/record.
+
 ## License
 
 MIT.

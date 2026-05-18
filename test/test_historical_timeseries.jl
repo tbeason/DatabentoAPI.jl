@@ -75,6 +75,9 @@ end
     @test store.metadata.dataset == "XNAS.ITCH"
     @test store.metadata.schema == Schema.TRADES
     @test all(r -> r isa DBN.TradeMsg, store)
+    # R1: TRADES is type-pure, so the records vector is concretely typed.
+    @test store.records isa Vector{DBN.TradeMsg}
+    @test eltype(store) === DBN.TradeMsg
 
     # Wire encoding sanity checks
     qpairs = get(captured[].kwargs, :query, [])
@@ -86,6 +89,27 @@ end
     @test haskey(d, "end")
     @test !haskey(d, "end_")
     @test occursin("timeseries.get_range", captured[].url)
+end
+
+@testset "historical get_range typed=false escape hatch" begin
+    bytes, n = _build_sample_dbn_zstd()
+    function mock(method, url, headers, body; kwargs...)
+        HTTP.Response(200; body = bytes)
+    end
+    c = Historical("test-key"; gateway = "https://hist.test", dispatcher = mock)
+    store = get_range(c;
+        dataset = "XNAS.ITCH",
+        schema  = Schema.TRADES,
+        symbols = ["AAPL"],
+        start   = "2024-01-02T14:30:00",
+        end_    = "2024-01-02T14:31:00",
+        typed   = false,
+    )
+    @test store isa DBNStore
+    @test length(store) == n
+    # With typed=false, records is the Union-typed Vector.
+    @test store.records isa Vector{DBN.DBNRecord}
+    @test all(r -> r isa DBN.TradeMsg, store)
 end
 
 @testset "record_type_for_schema" begin

@@ -417,6 +417,10 @@ end
 
 Capture a single Live schema to a single (optionally rotating) DBN file.
 Returns the path to the most recently opened output file.
+
+The default `compress_level = 1` favours throughput; bench measurements show
+L1 is ~35% faster on the write boundary than L3 in exchange for ~15% larger
+files (see `benchmark/PERF_REPORT.md`). Pass a higher level for archival.
 """
 function stream_to_file(; schema::Schema.T,
                         symbols,
@@ -426,7 +430,7 @@ function stream_to_file(; schema::Schema.T,
                         base_dir::Union{Nothing,AbstractString} = nothing,
                         duration_s::Union{Nothing,Real} = nothing,
                         compress::Bool = true,
-                        compress_level::Integer = 3,
+                        compress_level::Integer = 1,
                         rotate_seconds::Union{Nothing,Real} = nothing,
                         reconnect::Bool = true,
                         key = nothing,
@@ -496,7 +500,7 @@ function stream_multi_to_files(; schemas::AbstractVector,
                                base_dir::Union{Nothing,AbstractString} = nothing,
                                duration_s::Union{Nothing,Real} = nothing,
                                compress::Bool = true,
-                               compress_level::Integer = 3,
+                               compress_level::Integer = 1,
                                rotate_seconds::Union{Nothing,Real} = nothing,
                                reconnect::Bool = true,
                                key = nothing,

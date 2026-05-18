@@ -134,6 +134,45 @@ end
     @test endswith(out_path, ".dbn.zst")
 end
 
+# ---------- compress_level parameter coverage ----------
+
+@testset "live streaming — explicit compress_level override" begin
+    # The default is L1 (throughput-favoured). This test exercises an explicit
+    # higher level to keep the parameter path covered and confirm round-trip.
+    bytes, n = _make_dbn_bytes_with_trades(5; dataset = "TEST.MOCK")
+    handshake = function (sock)
+        write(sock, build_text_frame(lsg_version = "0.9.0"))
+        write(sock, build_text_frame(cram = "challenge"))
+        flush(sock)
+        read_text_frame(sock)
+        write(sock, build_text_frame(success = "1", session_id = "sess-1"))
+        flush(sock)
+        read_text_frame(sock)
+        read_text_frame(sock)
+        write(sock, bytes)
+        flush(sock)
+        sleep(0.3)
+    end
+    mock = spawn_mock_gateway(handshake)
+    mktempdir() do dir
+        out = joinpath(dir, "trades_l9.dbn.zst")
+        DatabentoAPI.stream_to_file(
+            schema = Schema.TRADES, symbols = ["AAPL"],
+            dataset = "TEST.MOCK", stype_in = SType.RAW_SYMBOL,
+            path = out, compress = true, compress_level = 9,
+            duration_s = 4, reconnect = false,
+            key = _TEST_KEY, gateway = "127.0.0.1", port = mock.port,
+            wire_compression = Compression.NONE,
+            heartbeat_log_interval_s = 1.0,
+        )
+        try; wait(mock.accept_task) catch end
+        @test isfile(out)
+        recs = DBN.read_dbn(out)
+        @test length(recs) >= n
+        @test all(r -> r isa DBN.TradeMsg, recs)
+    end
+end
+
 # ---------- ErrorMsg is terminal ----------
 
 @testset "live streaming — ErrorMsg is terminal" begin
