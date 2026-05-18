@@ -26,7 +26,7 @@ jobs:
         with:
           version: ${{ matrix.version }}
 
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
 
       # DBN.jl is unregistered — clone it as a sibling and develop it before testing.
       - name: Clone DBN.jl
