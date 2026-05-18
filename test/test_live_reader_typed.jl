@@ -234,6 +234,135 @@ end
     close(client)
 end
 
+@testset "typed live reader — distinct channels for OHLCV intervals" begin
+    # Regression: OHLCV_1S and OHLCV_1M both produce OHLCVMsg records but
+    # different rtypes (OHLCV_1S_MSG vs OHLCV_1M_MSG). Subscribing to both
+    # must give two distinct channels, each receiving only its own rtype's
+    # records. Pre-fix the reader looked up by Channel{OHLCVMsg} which
+    # returned the dict's arbitrary-first match, sending all OHLCV records
+    # to one channel and starving the other.
+
+    # Build a stream with 2 OHLCV_1S records + 2 OHLCV_1M records.
+    md = DBN.Metadata(
+        DBN.DBN_VERSION, "TEST.MOCK", DBN.Schema.MIX,
+        Int64(0), nothing, nothing, nothing,
+        DBN.SType.INSTRUMENT_ID, false,
+        ["AAPL"], String[], String[],
+        Tuple{String,String,Int64,Int64}[],
+    )
+    ts0 = Int64(1_700_000_000_000_000_000)
+    recs = DBN.DBNRecord[]
+    for (rt_enum, i) in ((DBN.RType.OHLCV_1S_MSG, 1),
+                         (DBN.RType.OHLCV_1S_MSG, 2),
+                         (DBN.RType.OHLCV_1M_MSG, 3),
+                         (DBN.RType.OHLCV_1M_MSG, 4))
+        hd = DBN.RecordHeader(UInt8(0), rt_enum, UInt16(1), UInt32(100 + i), ts0 + i)
+        push!(recs, DBN.OHLCVMsg(hd, Int64(100), Int64(110), Int64(95), Int64(105), UInt64(1000 + i)))
+    end
+    tmp, io = mktemp(); close(io)
+    DBN.write_dbn(tmp, md, recs)
+    bytes = read(tmp)
+    rm(tmp; force = true)
+
+    mock = _spawn_typed_mock(bytes)
+    client = DatabentoAPI.Live(_TEST_API_KEY_TYPED;
+        dataset = "TEST.MOCK",
+        gateway = "127.0.0.1", port = mock.port,
+        channel_size = 32,
+        typed = true)
+    DatabentoAPI.connect!(client)
+    ch_1s = DatabentoAPI.subscribe!(client;
+        schema = Schema.OHLCV_1S, symbols = ["AAPL"], stype_in = SType.RAW_SYMBOL)
+    ch_1m = DatabentoAPI.subscribe!(client;
+        schema = Schema.OHLCV_1M, symbols = ["AAPL"], stype_in = SType.RAW_SYMBOL)
+    @test ch_1s isa Channel{DBN.OHLCVMsg}
+    @test ch_1m isa Channel{DBN.OHLCVMsg}
+    @test ch_1s !== ch_1m   # different channel objects
+    DatabentoAPI.start!(client)
+
+    out_1s = DBN.OHLCVMsg[]; out_1m = DBN.OHLCVMsg[]
+    t1 = @async begin
+        try; while true; push!(out_1s, take!(ch_1s)); end
+        catch e; e isa InvalidStateException || rethrow(); end
+    end
+    t2 = @async begin
+        try; while true; push!(out_1m, take!(ch_1m)); end
+        catch e; e isa InvalidStateException || rethrow(); end
+    end
+    try; wait(mock.accept_task); catch; end
+    try; wait(t1); catch; end
+    try; wait(t2); catch; end
+
+    @test length(out_1s) == 2
+    @test length(out_1m) == 2
+    @test all(r -> r.hd.rtype == DBN.RType.OHLCV_1S_MSG, out_1s)
+    @test all(r -> r.hd.rtype == DBN.RType.OHLCV_1M_MSG, out_1m)
+
+    close(client)
+end
+
+@testset "typed live reader — MBP_1 + TBBO broadcast (shared rtype)" begin
+    # Schema.MBP_1 and Schema.TBBO both produce MBP_1_MSG-tagged MBP1Msg
+    # records. Subscribing to both on one Live: the reader can't tell
+    # the records apart at the wire level, so it broadcasts each MBP_1_MSG
+    # record to BOTH channels. (Better to deliver duplicates than drop
+    # records from one of the subscriptions.)
+    md = DBN.Metadata(
+        DBN.DBN_VERSION, "TEST.MOCK", DBN.Schema.MIX,
+        Int64(0), nothing, nothing, nothing,
+        DBN.SType.INSTRUMENT_ID, false,
+        ["AAPL"], String[], String[],
+        Tuple{String,String,Int64,Int64}[],
+    )
+    ts0 = Int64(1_700_000_000_000_000_000)
+    recs = DBN.DBNRecord[]
+    for i in 1:3
+        hd = DBN.RecordHeader(UInt8(0), DBN.RType.MBP_1_MSG, UInt16(1),
+                              UInt32(100 + i), ts0 + i)
+        push!(recs, DBN.MBP1Msg(hd, Int64(100), UInt32(50),
+            DBN.Action.MODIFY, DBN.Side.BID, UInt8(0), UInt8(1),
+            ts0 + i, Int32(0), UInt32(i),
+            DBN.BidAskPair(Int64(99), Int64(101), UInt32(10), UInt32(20),
+                           UInt32(1), UInt32(1))))
+    end
+    tmp, io = mktemp(); close(io)
+    DBN.write_dbn(tmp, md, recs)
+    bytes = read(tmp)
+    rm(tmp; force = true)
+
+    mock = _spawn_typed_mock(bytes)
+    client = DatabentoAPI.Live(_TEST_API_KEY_TYPED;
+        dataset = "TEST.MOCK",
+        gateway = "127.0.0.1", port = mock.port,
+        channel_size = 32,
+        typed = true)
+    DatabentoAPI.connect!(client)
+    ch_mbp1 = DatabentoAPI.subscribe!(client;
+        schema = Schema.MBP_1, symbols = ["AAPL"], stype_in = SType.RAW_SYMBOL)
+    ch_tbbo = DatabentoAPI.subscribe!(client;
+        schema = Schema.TBBO,  symbols = ["AAPL"], stype_in = SType.RAW_SYMBOL)
+    @test ch_mbp1 !== ch_tbbo
+    DatabentoAPI.start!(client)
+
+    a = DBN.MBP1Msg[]; b = DBN.MBP1Msg[]
+    t1 = @async begin
+        try; while true; push!(a, take!(ch_mbp1)); end
+        catch e; e isa InvalidStateException || rethrow(); end
+    end
+    t2 = @async begin
+        try; while true; push!(b, take!(ch_tbbo)); end
+        catch e; e isa InvalidStateException || rethrow(); end
+    end
+    try; wait(mock.accept_task); catch; end
+    try; wait(t1); catch; end
+    try; wait(t2); catch; end
+
+    @test length(a) == 3
+    @test length(b) == 3   # broadcast — both channels got the same records
+
+    close(client)
+end
+
 @testset "typed mode rejects untyped-only schemas" begin
     client = DatabentoAPI.Live(_TEST_API_KEY_TYPED;
         dataset = "TEST.MOCK",
