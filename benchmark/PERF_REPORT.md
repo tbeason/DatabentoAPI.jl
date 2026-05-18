@@ -121,6 +121,48 @@ The remaining gap to `post_http_decode_typed` (which just counts records, no Vec
 
 Reader timing window starts on first record arrival and ends when the expected N is reached.
 
+### Replay-stress bench against a real OPRA CMBP-1 archive
+
+`benchmark/bench_live_replay.jl` takes a real `.dbn.zst` (typically from `batch_download`) and streams it through the live-reader path on TCP loopback at full LAN speed (~3 GB/s per `bench_tcp_throughput.jl`). The mock writes as fast as the kernel allows; if the reader pipeline can't drain that rate, the channel saturates and the bench reports it.
+
+**Fixture**: SPY.OPT parent, schema CMBP_1, 1-min window (2026-05-13T13:30–13:31 UTC, the first minute of regular session). 7 722 839 records, 618 MB uncompressed, 206 MB zstd on the wire. ~128 k rec/s avg arrival rate — well below this bench's delivery, so the mock effectively saturates the channel for the whole replay.
+
+| channel_size | Drain rate | Producer wire rate | Peak depth | Near-full % | GC% |
+|---|---|---|---|---|---|
+| 4 096   | 2.7 M rec/s  | 31.7 MB/s | 99.9% | 11.9% | 11.6% |
+| 16 384  | 3.0 M rec/s  | 84.1 MB/s | 99.4% | 9.7%  | 10.2% |
+| 65 536  | 2.99 M rec/s | 82.0 MB/s | 99.8% | 9.0%  | 10.7% |
+| 262 144 | 2.97 M rec/s | 77.9 MB/s | 100.0%| 5.8%  | 11.1% |
+
+Sustained drain rate is **~3.0 M rec/s** of CMBP1Msg regardless of channel size — the consumer's `take!` loop is the floor, not the reader/decoder. Channel saturation in every configuration confirms the reader is delivering faster than the consumer can absorb.
+
+#### What this means in production
+
+| Workload | Rate | Headroom |
+|---|---|---|
+| SPY.OPT CMBP-1 (1 min sample, avg)     | ~128 k rec/s   | **23× headroom** at our 3.0 M rec/s ceiling |
+| ALL_SYMBOLS CMBP-1 (5 min sample, avg) | ~4.7 M rec/s   | **0.6× — overload at open** |
+| ALL_SYMBOLS CMBP-1 at 1 Gbps wire saturation (theoretical, ~9.4 M rec/s) | ~9.4 M rec/s | **0.3×** |
+
+For per-parent subscriptions (SPY.OPT, SPX.OPT, etc.) the current reader has plenty of headroom. For the full OPRA CMBP-1 firehose during the open, the consumer side becomes the gate. F1b (typed channel with concrete record type per subscription) is the lever that lifts this — `Channel{CMBP1Msg}` `take!` is faster than `Channel{Union}` `take!` because no Union dispatch per element, and the per-record GC pressure (10.5% here at scale) collapses.
+
+**Caveat**: this is a "consumer just counts" measurement. A real consumer (writing to disk, computing analytics, applying analytics) would be slower. The 3.0 M rec/s is an upper bound on what the channel layer can deliver, not a sustainable rate for arbitrary downstream work.
+
+#### How to reproduce
+
+```bash
+# 1. Fetch the archive (one-time, ~30 s queue + a few minutes processing)
+julia --project=benchmark benchmark/_fetch_replay_fixture.jl \
+    --symbols SPY.OPT \
+    --start   2026-05-13T13:30:00 \
+    --end     2026-05-13T13:31:00
+
+# 2. Replay against the live reader (~3 s per run)
+julia --project=benchmark -e 'using DatabentoAPI; \
+    include("benchmark/bench_live_replay.jl"); \
+    BenchLiveReplay.run(path = "benchmark/data/replay_SPY.OPT_2026-05-13T13_30_00__2026-05-13T13_31_00.dbn.zst")'
+```
+
 #### R3 root-cause investigation — the 50 k rec/s ceiling was a bench bug
 
 The original report claimed a 200× gap between in-process pipeline (10 M rec/s) and TCP-loopback (50 k rec/s). Layered diagnostics in `benchmark/bench_tcp_throughput.jl` and an ad-hoc instrumented harness revealed:
