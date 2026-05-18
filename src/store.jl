@@ -94,14 +94,18 @@ function decode_dbn_bytes(bytes::AbstractVector{UInt8}; zstd::Bool = true)::DBNS
 end
 
 function decode_dbn_bytes(bytes::AbstractVector{UInt8}, ::Type{T};
-                          zstd::Bool = true)::DBNStore{T} where {T}
+                          zstd::Bool = true,
+                          size_hint::Union{Nothing,Integer} = nothing)::DBNStore{T} where {T}
     io = IOBuffer(bytes)
-    # Rough heuristic: zstd-compressed Databento payloads expand ~6-8× for
-    # typed market-data records. Over-allocating slightly is much cheaper
-    # than the realloc dance under growth — the typed vector only holds
-    # `sizeof(T)` per slot, so overshooting by 50% costs maybe 25 MB on a
-    # 1 M-record query and saves the GC churn.
-    hint = if zstd
+    # Pick a sizehint for the output Vector{T}. Caller-supplied wins; otherwise
+    # use a rough heuristic — zstd-compressed Databento payloads expand ~6–8×
+    # for typed market-data records. Over-allocating slightly is much cheaper
+    # than the realloc dance under growth (the typed vector only holds
+    # `sizeof(T)` per slot, so overshooting by 50% costs ~25 MB on a 1 M-record
+    # query and avoids the GC churn).
+    hint = if size_hint !== nothing && size_hint > 0
+        Int(size_hint)
+    elseif zstd
         max(64, div(length(bytes) * 8, sizeof(T)))
     else
         max(64, div(length(bytes), sizeof(T)))

@@ -1,7 +1,7 @@
 """
     get_range(client; dataset, schema, symbols, start, end_=nothing,
               stype_in=SType.RAW_SYMBOL, stype_out=SType.INSTRUMENT_ID,
-              limit=nothing, typed=true)
+              limit=nothing, typed=true, size_hint=nothing)
 
 Fetch a time range of records from the Databento Historical API. Returns a [`DBNStore`](@ref).
 
@@ -13,6 +13,11 @@ the exception is `Schema.MIX`), the records vector is `Vector{T}` for the
 concrete record type — roughly 10× faster decode and 60% less allocation than
 the generic path. Pass `typed=false` to force the legacy `Vector{DBN.DBNRecord}`
 return for callers that rely on the Union element type.
+
+`size_hint` lets callers who know the record-count bound (e.g. from a prior
+`get_record_count` call) pre-size the records vector exactly. The default
+heuristic over-allocates by 10–20% to avoid realloc churn under growth; an
+exact hint avoids that waste.
 """
 function get_range(c::Historical;
                    dataset::AbstractString,
@@ -23,7 +28,8 @@ function get_range(c::Historical;
                    stype_in::SType.T  = SType.RAW_SYMBOL,
                    stype_out::SType.T = SType.INSTRUMENT_ID,
                    limit::Union{Nothing,Integer} = nothing,
-                   typed::Bool = true)
+                   typed::Bool = true,
+                   size_hint::Union{Nothing,Integer} = nothing)
     query = (
         dataset     = String(dataset),
         symbols     = symbols_str(symbols),
@@ -49,7 +55,7 @@ function get_range(c::Historical;
     if T === nothing
         return decode_dbn_bytes(bytes; zstd = true)
     else
-        return decode_dbn_bytes(bytes, T; zstd = true)
+        return decode_dbn_bytes(bytes, T; zstd = true, size_hint = size_hint)
     end
 end
 

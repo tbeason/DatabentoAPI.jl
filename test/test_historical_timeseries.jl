@@ -112,6 +112,35 @@ end
     @test all(r -> r isa DBN.TradeMsg, store)
 end
 
+@testset "historical get_range size_hint kwarg" begin
+    bytes, n = _build_sample_dbn_zstd()
+    function mock(method, url, headers, body; kwargs...)
+        HTTP.Response(200; body = bytes)
+    end
+    c = Historical("test-key"; gateway = "https://hist.test", dispatcher = mock)
+    # Exact hint: caller knows the record count from a prior get_record_count.
+    store = get_range(c;
+        dataset = "XNAS.ITCH",
+        schema  = Schema.TRADES,
+        symbols = ["AAPL"],
+        start   = "2024-01-02T14:30:00",
+        end_    = "2024-01-02T14:31:00",
+        size_hint = n,
+    )
+    @test length(store) == n
+    @test store.records isa Vector{DBN.TradeMsg}
+    # size_hint is ignored on the typed=false path; verify no crash.
+    store2 = get_range(c;
+        dataset = "XNAS.ITCH",
+        schema  = Schema.TRADES,
+        symbols = ["AAPL"],
+        start   = "2024-01-02T14:30:00",
+        end_    = "2024-01-02T14:31:00",
+        typed = false, size_hint = 999_999,
+    )
+    @test length(store2) == n
+end
+
 @testset "record_type_for_schema" begin
     using DatabentoAPI: record_type_for_schema
     @test record_type_for_schema(Schema.TRADES)     === DBN.TradeMsg

@@ -23,7 +23,7 @@ Each row is the minimum of N BenchmarkTools samples (`samples=5` for read, `samp
 | R6 — document `DBNStream` per-record alloc cost   | **DONE** | "Performance" note added to `DBN.jl/src/streaming.jl` `DBNStream` docstring + README pointer to `foreach_record`. |
 | R7 — bench-internal note                          | **DROPPED** | Not a code change. |
 
-**Test deltas:** DatabentoAPI.jl 188 → 197 tests (+9 covering R1 type assertions + R5 explicit override). DBN.jl test suite: same pass count; pre-existing 10 errors in `test_phase10_complete.jl` (missing `using DataFrames` for `nrow`/`ncol`) are unrelated to this pass.
+**Test deltas:** DatabentoAPI.jl 188 → 200 tests (+12 covering R1 type assertions, R1 typed=false escape hatch, R5 explicit override, F4 size_hint). DBN.jl test suite: same pass count; pre-existing 10 errors in `test_phase10_complete.jl` (missing `using DataFrames` for `nrow`/`ncol`) are unrelated to this pass.
 
 **Files changed (this pass):**
 - DatabentoAPI.jl: `src/store.jl` (DBNStore{T}, typed decode overloads); `src/historical/timeseries.jl` (typed `get_range` + `typed::Bool` kwarg); `src/live/streaming.jl` (compress_level default = 1); `test/test_historical_timeseries.jl` (typed-vector assertion + escape-hatch test); `test/test_live_streaming.jl` (compress_level override test); `README.md` (foreach_record perf pointer); `benchmark/profile_live_reader.jl` (NEW, R3 investigation).
@@ -254,12 +254,70 @@ R1+R2 collapsed all 80%+ GC paths to 0%. The remaining warm GC is in `DBNStream`
 
 ---
 
-## Future work / R3 follow-up
+## Future work
 
-1. **Live reader typed-loop fast path.** Add a `_foreach_record_impl` variant in DBN.jl that silently skips control records (`SymbolMappingMsg`, `SystemMsg`, `ErrorMsg`) rather than erroring on rtype mismatch. Then `_reader_loop` in `src/live/reader.jl` can dispatch to that variant when all subscriptions share one type-pure schema. In-process benchmark expects +23% throughput and −78% allocation; the real win materializes only once the TCP layer is no longer the bottleneck.
-2. **Linux re-benchmark of `bench_live_reader.jl`.** Confirm whether the 50 k rec/s ceiling is Windows-specific (kernel + libuv on Windows) or shared with Linux (libuv backend on both). If Linux exceeds ~1 M rec/s through loopback, the typed-loop fix becomes clearly worth landing.
-3. **R4 — `read_record` Ref boxing.** Still relevant for `DBNStream` and any caller iterating generically over mixed-schema streams. Pursue after we see real-world demand.
-4. **Per-call `size_hint` kwarg on `get_range`.** Callers who know record-count bounds (from `metadata.record_count` endpoints or prior runs) could pass an exact hint and avoid the 10–20% over-allocation our generic 8× heuristic costs.
+Status: each item below has been triaged after the implementation pass. Concrete design sketches are given where the next step is non-trivial.
+
+### F1 — Live reader typed-loop fast path  (R3 follow-up)
+
+**Gated on:** Linux re-bench (F2) confirming the TCP ceiling is Windows-specific OR a real-network workload where TCP isn't the bottleneck.
+
+**DBN.jl change** — add a control-record-aware typed reader to `src/streaming.jl`:
+
+```julia
+const _CONTROL_RTYPES = (RType.ERROR_MSG, RType.SYSTEM_MSG, RType.SYMBOL_MAPPING_MSG)
+
+function foreach_record_with_control(f_data, f_control,
+                                     decoder::DBNDecoder, ::Type{T}) where T
+    expected_rtype = _type_to_rtype_stream(T)
+    buffer = Ref{T}()
+    while !eof(decoder.io)
+        hd_result = read_record_header(decoder.io)
+        if hd_result isa Tuple
+            _, _, record_length = hd_result
+            skip(decoder.io, record_length - 2); continue
+        end
+        hd = hd_result
+        if hd.rtype == expected_rtype ||
+           (T === OHLCVMsg && hd.rtype in OHLCV_RTYPES)
+            buffer[] = _read_typed_record_stream(decoder, T, hd)
+            f_data(buffer[])
+        elseif hd.rtype in _CONTROL_RTYPES
+            rec = read_record_dispatch(decoder, hd, hd.rtype)
+            rec === nothing || f_control(rec)
+        else
+            skip(decoder.io, Int(hd.length) * LENGTH_MULTIPLIER - 16)
+        end
+    end
+end
+```
+
+**DatabentoAPI.jl change** — `src/live/client.jl` Live struct gains a `Channel{T}` data channel + retains `Channel{DBN.DBNRecord}` for control. Easiest path: keep current single `Channel{DBN.DBNRecord}` (one allocation per put! is amortized OK), and just use the typed reader to eliminate the per-record decode allocation (~78% reduction). The throughput gain from typed decode alone is ~+10%; the full +23% comes only with a typed channel.
+
+**Tests needed:** mock-gateway round-trip with interleaved SystemMsg + ErrorMsg + TradeMsg; assert both control records reach a separate handler and data records reach the channel typed.
+
+**Risk:** moderate. Adds a DBN.jl public API (`foreach_record_with_control`) and a Live struct field. Reconnect-path tests in `test_live_streaming.jl` need re-validation.
+
+### F2 — Linux re-benchmark of `bench_live_reader.jl`
+
+The in-process pipeline runs at 8–10 M rec/s; through Windows TCP loopback we measure 50 k rec/s — a 200× gap. Hypothesis: the Windows kernel + libuv stack adds per-packet overhead that Linux's epoll-based libuv does not.
+
+Action: run `julia --project=benchmark -e 'include("benchmark/bench_live_reader.jl"); BenchLiveReader.run(tiers = (:small,))'` on a Linux host and compare. Expected outcomes:
+
+- **Linux ≥ 1 M rec/s**: confirms Windows-specific. F1 becomes clearly worth landing.
+- **Linux ≈ 50 k rec/s**: libuv backend is the bottleneck on both platforms. F1 still helps CPU usage but won't change wall-clock; treat as a CPU/alloc optimization rather than a throughput one. Worth investigating `unsafe_read` against `bytesavailable` to bypass libuv's per-call buffering.
+
+Cannot be done from the current Windows development host.
+
+### F3 — Eliminate `Ref` boxing in `DBN.read_record`  (R4)
+
+**Current state:** after R1+R2, the only performance-sensitive callers of generic `read_record` are: the live reader (`src/live/reader.jl:49`) and `DBNStream`. The live reader is better served by F1 (a typed reader that doesn't go through `read_record` at all). `DBNStream` is doc-deprecated for high-throughput use (R6).
+
+**Recommendation:** **skip indefinitely**. Pursue only if a specific workload shows generic `read_record` as a measured hot spot AND F1 doesn't already cover it.
+
+### F4 — `size_hint` kwarg on `get_range`  **[DONE]**
+
+`get_range(c; ..., size_hint = n)` now accepts an exact record-count bound from callers who have one (e.g. from a prior `get_record_count` call). When supplied, it overrides the default 8×-zstd-expansion heuristic, avoiding the 10–20% over-allocation. Tested with both `typed=true` and `typed=false`.
 
 ---
 
