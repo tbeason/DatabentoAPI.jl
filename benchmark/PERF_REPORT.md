@@ -22,7 +22,7 @@ Each row is the minimum of N BenchmarkTools samples (`samples=5` for read, `samp
 | R5 — `stream_to_file` default `compress_level = 1` | **DONE** | Default changed in `src/live/streaming.jl`. Bench-derived rationale (L1 ≈ 35% faster than L3 at write boundary) captured in the docstring. New explicit-override test added. |
 | R6 — document `DBNStream` per-record alloc cost   | **DONE** | "Performance" note added to `DBN.jl/src/streaming.jl` `DBNStream` docstring + README pointer to `foreach_record`. |
 | R7 — bench-internal note                          | **DROPPED** | Not a code change. |
-| F1b — typed live channels                         | **DONE**    | `Live(...; typed=true)` opts in. `subscribe!` returns `Channel{T}`; control records route to `control_channel(client)`. `stream_to_file` / `stream_multi_to_files` migrated to use typed Live. **−85% allocation** on the real OPRA CMBP-1 replay; throughput roughly neutral (record-size dependent). See "F1b" in Future Work section. |
+| F1b — typed live channels                         | **DONE**    | `Live(...; typed=true)` opts in. `subscribe!` returns `Channel{T}`; control records route to `control_channel(client)`. `stream_to_file` / `stream_multi_to_files` migrated to use typed Live. **+25% throughput** on the real OPRA CMBP-1 replay (after dispatch-tree reorder). Allocation is roughly equal across modes — Julia's stdlib `Channel.put!`/`take!` allocates Condition bookkeeping regardless of element type, dominating the per-cycle cost. See "F1b" in Future Work section. |
 
 **Test deltas:** DatabentoAPI.jl 188 → 200 tests (+12 covering R1 type assertions, R1 typed=false escape hatch, R5 explicit override, F4 size_hint). DBN.jl test suite: same pass count; pre-existing 10 errors in `test_phase10_complete.jl` (missing `using DataFrames` for `nrow`/`ncol`) are unrelated to this pass.
 
@@ -352,20 +352,32 @@ overloads for the previously-untyped schemas (`STATISTICS`, `CMBP_1`,
 `CBBO_1S/M`, `TCBBO`, `BBO_1S/M`, `TBBO`).
 
 **Measured (`bench_live_replay` against the real OPRA SPY.OPT CMBP-1
-archive, 7.72 M records, 206 MB wire)**:
+archive, 7.72 M records, 206 MB wire — 5-run medians, warmed up)**:
 
 | Mode | Drain rate | Alloc | GC% | Channel peak |
 |---|---|---|---|---|
-| Untyped (Union channel) | 2.95 M rec/s | 37.3 MB | 10.7% | 99.8% |
-| Typed (`Channel{CMBP1Msg}` + control channel) | 2.77 M rec/s | **5.5 MB (−85%)** | 10.1% | 99.8% |
+| Untyped (Union channel) | 2.55 M rec/s | 89.3 MB | ~11% | 99.8% |
+| Typed (`Channel{CMBP1Msg}` + control channel) | **3.19 M rec/s** | 98.7 MB | ~11% | 99.8% |
+| **Delta** | **+25.1%** | +10.5% (noise) | — | — |
 
-The big alloc win materialised as predicted. Wall-time delta was small and
-slightly negative (−6%) on this workload — the in-process bench's +23%
-projection was for `TradeMsg` (48 bytes), but `CMBP1Msg` is larger (~80 bytes),
-so the typed channel's inline value copy costs more per put!/take! than the
-Union channel's pointer move. The net is alloc-positive, throughput-neutral
-on this record size. For smaller records (TradeMsg, MBP1Msg) we'd expect
-the throughput to flip positive too.
+The throughput win materialised. Allocation is essentially unchanged —
+Julia's stdlib `Channel.put!`/`take!` allocates Condition-variable
+bookkeeping per cycle regardless of element type (verified at 128
+bytes/cycle for both `Channel{TradeMsg}` and `Channel{DBN.DBNRecord}`).
+The earlier "−85% alloc" headline reported in an in-process synthetic
+bench was real for that setup but did not translate to the
+through-channel workload — the channel's per-cycle alloc dominates.
+The true allocation-zero path would require either a custom
+non-allocating channel or a typed-callback API that bypasses channels
+entirely.
+
+**Throughput-win attribution**:
+
+| Component | Effect |
+|---|---|
+| Typed decode → typed `put!` (monomorphic, no Union dispatch) | Removes per-record Union-box overhead in the producer |
+| Type-stable consumer `take!(Channel{T})` (no Union unbox) | Removes per-record Union dispatch in the consumer |
+| Dispatch-tree reorder (`ch !== nothing && rt == X`) | For sparse subscriptions, 13 unsubscribed branches collapse to fast pointer compares instead of enum compares; ~150 ms saved over 7.7 M records |
 
 `bench_live_reader` (synthetic 100 k TradeMsg, channel saturated):
 

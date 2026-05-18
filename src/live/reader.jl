@@ -95,55 +95,59 @@ function _reader_loop_typed(c::Live)
             hd = hd_result
             rt = hd.rtype
 
-            # Hot path: data-record rtypes, type-stable put!. Schemas not
-            # subscribed are skipped (channel is nothing) so the record
-            # body is still consumed via skip below.
-            if rt == DBN.RType.MBP_0_MSG && ch_trades !== nothing
+            # Hot path: data-record rtypes, type-stable put!. The nullness
+            # check on the per-schema channel is FIRST in each branch so that
+            # unsubscribed schemas short-circuit on a pointer comparison
+            # (~1 cycle) before the slower rtype enum comparison. For a
+            # single-schema subscription this collapses the 13 unsubscribed
+            # branches to 13 fast nothing-checks instead of 13 enum
+            # comparisons.
+            if ch_trades !== nothing && rt == DBN.RType.MBP_0_MSG
                 put!(ch_trades, DBN.read_trade_msg(decoder, hd))
                 continue
-            elseif rt == DBN.RType.MBO_MSG && ch_mbo !== nothing
+            elseif ch_mbo !== nothing && rt == DBN.RType.MBO_MSG
                 put!(ch_mbo, DBN.read_mbo_msg(decoder, hd))
                 continue
-            elseif rt == DBN.RType.MBP_1_MSG && ch_mbp1 !== nothing
+            elseif ch_mbp1 !== nothing && rt == DBN.RType.MBP_1_MSG
                 put!(ch_mbp1, DBN.read_mbp1_msg(decoder, hd))
                 continue
-            elseif rt == DBN.RType.MBP_10_MSG && ch_mbp10 !== nothing
+            elseif ch_mbp10 !== nothing && rt == DBN.RType.MBP_10_MSG
                 put!(ch_mbp10, DBN.read_mbp10_msg(decoder, hd))
                 continue
-            elseif (rt == DBN.RType.OHLCV_1S_MSG ||
-                    rt == DBN.RType.OHLCV_1M_MSG ||
-                    rt == DBN.RType.OHLCV_1H_MSG ||
-                    rt == DBN.RType.OHLCV_1D_MSG) && ch_ohlcv !== nothing
+            elseif ch_ohlcv !== nothing && (rt == DBN.RType.OHLCV_1S_MSG ||
+                                            rt == DBN.RType.OHLCV_1M_MSG ||
+                                            rt == DBN.RType.OHLCV_1H_MSG ||
+                                            rt == DBN.RType.OHLCV_1D_MSG)
                 put!(ch_ohlcv, DBN.read_ohlcv_msg(decoder, hd))
                 continue
-            elseif rt == DBN.RType.STATUS_MSG && ch_status !== nothing
+            elseif ch_status !== nothing && rt == DBN.RType.STATUS_MSG
                 put!(ch_status, DBN.read_status_msg(decoder, hd))
                 continue
-            elseif rt == DBN.RType.INSTRUMENT_DEF_MSG && ch_def !== nothing
+            elseif ch_def !== nothing && rt == DBN.RType.INSTRUMENT_DEF_MSG
                 put!(ch_def, DBN.read_instrument_def_msg(decoder, hd))
                 continue
-            elseif rt == DBN.RType.IMBALANCE_MSG && ch_imbal !== nothing
+            elseif ch_imbal !== nothing && rt == DBN.RType.IMBALANCE_MSG
                 put!(ch_imbal, DBN.read_imbalance_msg(decoder, hd))
                 continue
-            elseif rt == DBN.RType.STAT_MSG && ch_stat !== nothing
+            elseif ch_stat !== nothing && rt == DBN.RType.STAT_MSG
                 put!(ch_stat, DBN.read_stat_msg(decoder, hd))
                 continue
-            elseif rt == DBN.RType.CMBP_1_MSG && ch_cmbp1 !== nothing
+            elseif ch_cmbp1 !== nothing && rt == DBN.RType.CMBP_1_MSG
                 put!(ch_cmbp1, DBN.read_cmbp1_msg(decoder, hd))
                 continue
-            elseif rt == DBN.RType.CBBO_1S_MSG && ch_cbbo1s !== nothing
+            elseif ch_cbbo1s !== nothing && rt == DBN.RType.CBBO_1S_MSG
                 put!(ch_cbbo1s, DBN.read_cbbo1s_msg(decoder, hd))
                 continue
-            elseif rt == DBN.RType.CBBO_1M_MSG && ch_cbbo1m !== nothing
+            elseif ch_cbbo1m !== nothing && rt == DBN.RType.CBBO_1M_MSG
                 put!(ch_cbbo1m, DBN.read_cbbo1m_msg(decoder, hd))
                 continue
-            elseif rt == DBN.RType.TCBBO_MSG && ch_tcbbo !== nothing
+            elseif ch_tcbbo !== nothing && rt == DBN.RType.TCBBO_MSG
                 put!(ch_tcbbo, DBN.read_tcbbo_msg(decoder, hd))
                 continue
-            elseif rt == DBN.RType.BBO_1S_MSG && ch_bbo1s !== nothing
+            elseif ch_bbo1s !== nothing && rt == DBN.RType.BBO_1S_MSG
                 put!(ch_bbo1s, DBN.read_bbo1s_msg(decoder, hd))
                 continue
-            elseif rt == DBN.RType.BBO_1M_MSG && ch_bbo1m !== nothing
+            elseif ch_bbo1m !== nothing && rt == DBN.RType.BBO_1M_MSG
                 put!(ch_bbo1m, DBN.read_bbo1m_msg(decoder, hd))
                 continue
             end
