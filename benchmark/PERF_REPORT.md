@@ -261,43 +261,46 @@ Status: each item below has been triaged after the implementation pass. Concrete
 
 ### F1 — Live reader typed-loop fast path  (was R3 follow-up; now opportunistic)
 
-With the live reader actually running at 8.87 M rec/s (no longer "200× slow"), this is no longer urgent. Still worth doing for the alloc reduction:
+With the live reader actually running at 8.87 M rec/s (no longer "200× slow"), this is no longer urgent. The "+23% throughput, −78% allocation" headline from earlier drafts of this report referred to the **full** F1 variant below (typed decode AND typed channel). Halfway versions buy almost nothing — see the calibration table below.
 
-In-process bench shows the typed pipeline at **10.5 M rec/s, 4.1 MB alloc / 100 k records** vs the current Union pipeline at **8.5 M rec/s, 18.8 MB alloc**. That's +23% throughput and **−78% allocation**.
+#### Two variants
 
-**DBN.jl change** — add a control-record-aware typed reader to `src/streaming.jl`:
+**F1a — typed decode only, keep `Channel{DBN.DBNRecord}`** (~30 min change)
 
 ```julia
-const _CONTROL_RTYPES = (RType.ERROR_MSG, RType.SYSTEM_MSG, RType.SYMBOL_MAPPING_MSG)
-
-function foreach_record_with_control(f_data, f_control,
-                                     decoder::DBNDecoder, ::Type{T}) where T
-    expected_rtype = _type_to_rtype_stream(T)
-    buffer = Ref{T}()
-    while !eof(decoder.io)
-        hd_result = read_record_header(decoder.io)
-        if hd_result isa Tuple
-            _, _, record_length = hd_result
-            skip(decoder.io, record_length - 2); continue
-        end
-        hd = hd_result
-        if hd.rtype == expected_rtype ||
-           (T === OHLCVMsg && hd.rtype in OHLCV_RTYPES)
-            buffer[] = _read_typed_record_stream(decoder, T, hd)
-            f_data(buffer[])
-        elseif hd.rtype in _CONTROL_RTYPES
-            rec = read_record_dispatch(decoder, hd, hd.rtype)
-            rec === nothing || f_control(rec)
-        else
-            skip(decoder.io, Int(hd.length) * LENGTH_MULTIPLIER - 16)
-        end
-    end
-end
+T = record_type_for_dbn_schema(subscriptions[1].schema)
+DBN.foreach_record_with_control(
+    rec  -> put!(c.channel, rec),
+    ctrl -> put!(c.channel, ctrl),
+    decoder, T)
 ```
 
-**DatabentoAPI.jl change** — `_reader_loop` dispatches to the typed-loop variant when all subscriptions share one type-pure schema. The current `Channel{DBN.DBNRecord}` stays; the per-record put! still boxes, but the per-record decode no longer does.
+Avoids the Union allocation on the decode side. But `put!(Channel{DBN.DBNRecord}, concrete_T_value)` still has to box the value into the channel's Union element type — the same heap allocation just happens one frame later. Net: **+5–10% throughput, minimal alloc reduction.** Not worth the new DBN.jl public API.
 
-**Risk:** moderate. Adds a DBN.jl public API. Reconnect-path tests in `test_live_streaming.jl` need re-validation. Priority: low (real-world payoff is alloc reduction only; throughput is already good).
+**F1b — typed decode AND typed channel** (medium refactor)
+
+This is the version that hits the in-process bench's +23% / −78% numbers. Requires:
+
+1. New DBN.jl API: `foreach_record_with_control(f_data, f_control, decoder, ::Type{T})`. Calls `f_data` with a concrete `T` (via reused `Ref{T}()` buffer, zero alloc) for matching rtypes, `f_control` with a Union for `ErrorMsg`/`SystemMsg`/`SymbolMappingMsg`.
+2. `Live` parameterised as `Live{T}` with default `T = DBN.DBNRecord` (back-compat). New `channel_eltype` kwarg on the constructor; default = current behaviour.
+3. Second channel (or callback) for control records, since `Channel{TradeMsg}` cannot hold `SystemMsg`. Likely shape: `control_channel::Channel{DBN.DBNRecord}` with `subscribe_control(c, fn)` for consumers.
+4. Reader loop dispatches to typed-or-generic path based on `T` and subscription count.
+5. Tests: reconnect path (`test_live_streaming.jl`), mixed-rtype mock-gateway round trip, control-record routing.
+
+**Risk:** moderate. Adds DBN.jl public API + `Live` API surface. Reconnect-path tests need re-validation.
+
+#### Calibration (from `profile_live_reader.jl` in-process bench, 100 k TradeMsg)
+
+| Variant | M rec/s | Alloc/100 k | Notes |
+|---|---|---|---|
+| Current (`read_record` + `Channel{Union}`)        |  8.5 | 18.8 MB | baseline |
+| F1a (typed read + `Channel{Union}`)                | ~9–9.5 | ~16 MB | put! re-boxes — small win |
+| F1b (typed read + `Channel{TradeMsg}`)             | 10.5 | 4.1 MB | full +23% / −78% |
+| Channel-only baseline (no decode at all)           | 22.1 | 2.4 MB | ceiling left after decode |
+
+#### Verdict
+
+This is **only worth doing as F1b**, and only for a niche audience: callers running single-schema live captures at >5 Gbps wire rate (the current 8.5 M rec/s × 48 bytes ≈ 408 MB/s decompressed ≈ ~5 Gbps after zstd assuming a 6× ratio), or memory-tight long-running processes that can't tolerate ~188 bytes/record GC pressure. For everything else the current Union-channel path is already several times faster than any realistic wire delivers. Recommendation: leave on the shelf unless a real workload demands it.
 
 ### F2 — Linux re-benchmark  **[no longer required]**
 
