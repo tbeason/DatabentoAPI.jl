@@ -39,7 +39,10 @@ function _spawn(bytes; wire_zstd::Bool = false)
                     write(sock, read(io, chunk))
                     flush(sock)
                 end
-                sleep(2.0)
+                # Close immediately (no sleep). See bench_live_reader.jl note —
+                # holding the connection open after payload makes the reader's
+                # final readbytes! call block for the full hold duration
+                # waiting for EOF.
             finally
                 isopen(sock) && Sockets.close(sock)
             end

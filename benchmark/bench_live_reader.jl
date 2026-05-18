@@ -42,8 +42,13 @@ function _spawn(bytes; wire_zstd::Bool = false)
                     write(sock, read(io, chunk))
                     flush(sock)
                 end
-                # Hold long enough for the client to drain.
-                sleep(2.0)
+                # NOTE: we do NOT sleep here. An earlier version held the
+                # connection open for 2 s after the payload, which made the
+                # reader's final readbytes!(sock, buf, 64KB) call block for
+                # that full 2 s waiting for EOF (it had asked for more bytes
+                # than the stream contained). Closing immediately lets the
+                # reader see EOF promptly and exit. See PERF_REPORT R3
+                # follow-up for the diagnosis.
             finally
                 isopen(sock) && Sockets.close(sock)
             end

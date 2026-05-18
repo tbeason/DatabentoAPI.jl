@@ -17,7 +17,7 @@ Each row is the minimum of N BenchmarkTools samples (`samples=5` for read, `samp
 |---|---|---|
 | R1 — typed `get_range` (`DBNStore{T}`)            | **DONE** | `get_range` at 1 M records: **307 ms → 238 ms (-23%)**, alloc 240 MB → 266 MB (over-sized hint), GC 3% → 0.1%. At 100 k: 27 ms → 20 ms (-26%), 5.4 M rec/s. |
 | R2 — schema-aware typed dispatch in `DBN.read_dbn` | **DONE** | `read_dbn` at 1 M records: **300 ms → 34 ms (-89%)**, GC 84.2% → 0%, **3.3 → 29.8 M rec/s (+9×)**. At 100 k: 212 ms → 3.4 ms (-98%), GC 97.6% → 0%, **0.47 → 29.7 M rec/s (+63×)**. |
-| R3 — live reader investigation                    | **DONE (investigation only)** | New `profile_live_reader.jl` proves the **Windows TCP loopback is the bottleneck**: in-process pipeline runs at 8–10 M rec/s (~200× faster than the 50 k rec/s through TCP). Pipeline code change deferred — typed-loop fix would need control-record handling in `_foreach_record_impl` (see R4). |
+| R3 — live reader investigation                    | **DONE (no fix needed)** | The "50 k rec/s ceiling" was a **benchmark bug**, not a real performance issue. Root cause: the mock TCP server slept 2 s after writing the payload before closing the socket; the reader's final `readbytes!(sock, buf, 64 KB)` call blocks for that full 2 s waiting for EOF (it asked for more bytes than the stream contained). Fixing the mock to close immediately yields **8.87 M rec/s plain / 6.16 M rec/s zstd** — a 177× improvement and within range of the in-process pipeline. The live reader code is fine as-is. |
 | R4 — eliminate Ref boxing in `DBN.read_record`    | **DEFERRED** | Out of scope this pass; the most impactful path (Vector-materialising `read_dbn`) is now covered by R2's typed dispatch, so the remaining audience for R4 is narrower. Separate follow-up. |
 | R5 — `stream_to_file` default `compress_level = 1` | **DONE** | Default changed in `src/live/streaming.jl`. Bench-derived rationale (L1 ≈ 35% faster than L3 at write boundary) captured in the docstring. New explicit-override test added. |
 | R6 — document `DBNStream` per-record alloc cost   | **DONE** | "Performance" note added to `DBN.jl/src/streaming.jl` `DBNStream` docstring + README pointer to `foreach_record`. |
@@ -26,7 +26,7 @@ Each row is the minimum of N BenchmarkTools samples (`samples=5` for read, `samp
 **Test deltas:** DatabentoAPI.jl 188 → 200 tests (+12 covering R1 type assertions, R1 typed=false escape hatch, R5 explicit override, F4 size_hint). DBN.jl test suite: same pass count; pre-existing 10 errors in `test_phase10_complete.jl` (missing `using DataFrames` for `nrow`/`ncol`) are unrelated to this pass.
 
 **Files changed (this pass):**
-- DatabentoAPI.jl: `src/store.jl` (DBNStore{T}, typed decode overloads); `src/historical/timeseries.jl` (typed `get_range` + `typed::Bool` kwarg); `src/live/streaming.jl` (compress_level default = 1); `test/test_historical_timeseries.jl` (typed-vector assertion + escape-hatch test); `test/test_live_streaming.jl` (compress_level override test); `README.md` (foreach_record perf pointer); `benchmark/profile_live_reader.jl` (NEW, R3 investigation).
+- DatabentoAPI.jl: `src/store.jl` (DBNStore{T}, typed decode overloads); `src/historical/timeseries.jl` (typed `get_range` + `typed::Bool` + `size_hint` kwargs); `src/live/streaming.jl` (compress_level default = 1); `test/test_historical_timeseries.jl` (typed-vector assertion + escape-hatch + size_hint tests); `test/test_live_streaming.jl` (compress_level override test); `README.md` (foreach_record perf pointer); `benchmark/profile_live_reader.jl` (NEW, R3 investigation); `benchmark/bench_tcp_throughput.jl` (NEW, R3 root-cause diagnostic); `benchmark/bench_live_reader.jl` + `benchmark/bench_stream_to_file.jl` (fix mock-sleep bug that caused the false R3 ceiling).
 - DBN.jl: `src/streaming.jl` (record_type_for_dbn_schema helper + DBNStream perf docstring); `src/decode.jl` (schema-aware fast path in `read_dbn` and `read_dbn_with_metadata`, with rtype-mismatch fallback for mixed files).
 
 ---
@@ -36,7 +36,7 @@ Each row is the minimum of N BenchmarkTools samples (`samples=5` for read, `samp
 1. **Generic eager `DBN.read_dbn` spends 80–97% of wall time in GC.** The `Vector{Union{18 types}}` push-loop is catastrophic. Typed eager (`read_dbn_typed`) is **9× faster** at 1 M records and **65× faster** at 100 k records. This is the single highest-impact finding.
 2. **`DatabentoAPI.get_range` inherits this cost** — it materialises 240 MB of Union-typed records for a 1 M-record query. A typed-vector variant inside `get_range` would cut alloc by ~60% and wall time by 30–80% depending on size.
 3. **`foreach_record` typed is the gold standard.** 45 M rec/s uncompressed, 18 M rec/s zstd, **0.13 bytes/record** allocation total. Already the recommended fast path.
-4. **The live reader runs at ~50 k rec/s on TCP loopback** — an order of magnitude slower than file decode. The bottleneck appears upstream of the channel; the channel itself is not at fault (a pure `Channel{Int}` drains 100 k items in 9 ms). `stream_to_file` inherits this ceiling.
+4. **The live reader runs at 8.87 M rec/s plain / 6.16 M rec/s zstd through TCP loopback** — comparable to file decode. The earlier "50 k rec/s ceiling" reported during the pressure-test pass was a benchmark artefact (mock TCP server held the connection open for 2 s after writing, so the reader's last `readbytes!` call blocked waiting for EOF). Fix landed; numbers above are post-fix.
 5. **Write throughput is healthy and not a priority.** 20 M rec/s uncompressed, 7 M rec/s at zstd L3. L9 collapses to 1.9 M rec/s and offers no payoff for streaming-capture workloads.
 
 ---
@@ -112,38 +112,39 @@ Each row is the minimum of N BenchmarkTools samples (`samples=5` for read, `samp
 
 The remaining gap to `post_http_decode_typed` (which just counts records, no Vector storage) is the cost of storing decoded records into the returned `DBNStore`. That's intrinsic to the eager API.
 
-### DatabentoAPI live reader (mock TCP loopback)
+### DatabentoAPI live reader (mock TCP loopback) — post-fix
 
-| Path | Size | n rec | Time | k rec/s | MB/s |
+| Path | Size | n rec | Time | M rec/s | MB/s |
 |---|---|---|---|---|---|
-| `live_plain` | 100 k | 100 000 | 2.016 s | **50** | 2.3 |
-| `live_zstd`  | 100 k | 100 000 | 2.013 s | **50** | 2.3 |
+| `live_plain` | 100 k | 100 000 | 11.3 ms | **8.87** | 406 |
+| `live_zstd`  | 100 k | 100 000 | 16.2 ms | **6.16** | 282 |
 
 Reader timing window starts on first record arrival and ends when the expected N is reached.
 
-#### R3 root-cause investigation (in-process profile)
+#### R3 root-cause investigation — the 50 k rec/s ceiling was a bench bug
 
-`benchmark/profile_live_reader.jl` drives the same reader-loop body against an `IOBuffer` source — same `CountingIO → BufferedReader → DBNDecoder → Channel → consumer` pipeline, no TCP socket. The result is dramatic:
+The original report claimed a 200× gap between in-process pipeline (10 M rec/s) and TCP-loopback (50 k rec/s). Layered diagnostics in `benchmark/bench_tcp_throughput.jl` and an ad-hoc instrumented harness revealed:
 
-| Variant | n rec | Time | M rec/s | Alloc |
-|---|---|---|---|---|
-| `channel_only` `Channel{TradeMsg}` (no decode) | 100 k | 4.5 ms | **22.1** | 2.4 MB |
-| `channel_only` `Channel{Any}` (no decode)      | 100 k | 5.0 ms | 19.9 | 6.5 MB |
-| `channel_only` `Channel{Union}` (no decode)    | 100 k | 5.5 ms | 18.3 | 6.5 MB |
-| `pipeline_Union_channel` (current)             | 100 k | 11.8 ms | 8.5 | 18.8 MB |
-| `pipeline_Any_channel`                         | 100 k | 10.9 ms | 9.2 | 18.8 MB |
-| `pipeline_typed` (proposed)                    | 100 k | 9.5 ms | 10.5 | 4.1 MB |
+| Test | Result |
+|---|---|
+| Raw `readbytes!(sock, 64 KB)` on TCPSocket | **3 GB/s** |
+| Same through `CountingIO + BufferedReader` (bulk) | 800 MB/s |
+| BufferedReader `read(UInt64)` x 600 k (live reader path) | **1.5 MB/s** ⚠️ |
+| Same with mock that closes the socket immediately after writing | **1.1 GB/s** ✅ |
 
-**Headline: the in-process pipeline is ~200× faster than the TCP-loopback bench (10 M rec/s vs 50 k rec/s).** The bottleneck on Windows is the kernel TCP / `Sockets.jl` `readbytes!` path, NOT the decode or channel.
+Smoking gun: 74 BufferedReader refills, each taking 41 ms. But timing a single `readbytes!(sock, 64 KB)` against the same socket after sleep showed 2 µs — a 20,000× difference. The 41 ms came from the **final** refill call: BufferedReader asks for `length(buffer) = 64 KB` but the stream only has, say, 21 KB left before EOF. `readbytes!(::TCPSocket, ::Vector{UInt8}, ::Int)` blocks via `wait_readnb` until either nb bytes arrive OR the socket closes. With the mock holding the connection open for 2 s post-payload, the last refill blocks the full 2 s waiting for FIN.
 
-The typed-loop variant would win **+23% throughput and −78% alloc** on the decode side, but the win is masked by the TCP ceiling on Windows. Landing the typed loop requires `_foreach_record_impl` (or a variant) to silently skip control records like `SymbolMappingMsg`, `SystemMsg`, `ErrorMsg`, since live streams always interleave them with data. That change is feasible but is itself a small DBN.jl API addition; deferred to its own follow-up. Saved profile dumps:
+**Fix:** `benchmark/bench_live_reader.jl` and `benchmark/bench_stream_to_file.jl` mocks now close the socket immediately after writing the payload (no post-write `sleep`). Result: live reader 50 k → 8.87 M rec/s (**177×**), `stream_to_file` 2.15 s → 148 ms (**14×**).
 
-- `benchmark/results/live_inproc_union_channel.profile.txt` — current path.
-- `benchmark/results/live_inproc_typed.profile.txt` — proposed typed path.
+Mitigation guidance for real-world consumers: the live gateway streams continuously and doesn't close after a finite payload, so this artefact never appears in production. If a consumer wraps a live stream around a finite chunk of bytes (e.g. a recorded replay file pretending to be a live stream), prefer `read_dbn` / `foreach_record` over the Live client.
 
-#### Recommended next step for live throughput
+#### Profile dumps (for reference)
 
-Linux re-benchmark: the same `bench_live_reader` script should be run on a Linux host to confirm whether the 50 k ceiling is Windows-specific. If Linux exceeds, say, 1 M rec/s through TCP loopback, the typed-loop fix becomes clearly worth landing. If Linux is similarly capped, the bottleneck is libuv's TCP backend (Julia's Sockets.jl uses libuv on all platforms) and the typed-loop fix still benefits CPU-side cost but won't move the wall-clock ceiling.
+- `benchmark/results/live_inproc_union_channel.profile.txt` — in-process pipeline, current path.
+- `benchmark/results/live_inproc_typed.profile.txt` — in-process pipeline, proposed typed path.
+- `benchmark/bench_tcp_throughput.jl` — raw TCP loopback chunk-size sweep (3 GB/s baseline).
+
+Despite the bench bug, the in-process profile data is still useful: it shows the decode pipeline can do 10 M rec/s, and that a typed-loop variant could add another +23%. That remains a real future-work opportunity (F1 below) — just not a 200× one.
 
 ### DatabentoAPI `stream_to_file` (mock TCP source)
 
@@ -258,9 +259,11 @@ R1+R2 collapsed all 80%+ GC paths to 0%. The remaining warm GC is in `DBNStream`
 
 Status: each item below has been triaged after the implementation pass. Concrete design sketches are given where the next step is non-trivial.
 
-### F1 — Live reader typed-loop fast path  (R3 follow-up)
+### F1 — Live reader typed-loop fast path  (was R3 follow-up; now opportunistic)
 
-**Gated on:** Linux re-bench (F2) confirming the TCP ceiling is Windows-specific OR a real-network workload where TCP isn't the bottleneck.
+With the live reader actually running at 8.87 M rec/s (no longer "200× slow"), this is no longer urgent. Still worth doing for the alloc reduction:
+
+In-process bench shows the typed pipeline at **10.5 M rec/s, 4.1 MB alloc / 100 k records** vs the current Union pipeline at **8.5 M rec/s, 18.8 MB alloc**. That's +23% throughput and **−78% allocation**.
 
 **DBN.jl change** — add a control-record-aware typed reader to `src/streaming.jl`:
 
@@ -292,32 +295,21 @@ function foreach_record_with_control(f_data, f_control,
 end
 ```
 
-**DatabentoAPI.jl change** — `src/live/client.jl` Live struct gains a `Channel{T}` data channel + retains `Channel{DBN.DBNRecord}` for control. Easiest path: keep current single `Channel{DBN.DBNRecord}` (one allocation per put! is amortized OK), and just use the typed reader to eliminate the per-record decode allocation (~78% reduction). The throughput gain from typed decode alone is ~+10%; the full +23% comes only with a typed channel.
+**DatabentoAPI.jl change** — `_reader_loop` dispatches to the typed-loop variant when all subscriptions share one type-pure schema. The current `Channel{DBN.DBNRecord}` stays; the per-record put! still boxes, but the per-record decode no longer does.
 
-**Tests needed:** mock-gateway round-trip with interleaved SystemMsg + ErrorMsg + TradeMsg; assert both control records reach a separate handler and data records reach the channel typed.
+**Risk:** moderate. Adds a DBN.jl public API. Reconnect-path tests in `test_live_streaming.jl` need re-validation. Priority: low (real-world payoff is alloc reduction only; throughput is already good).
 
-**Risk:** moderate. Adds a DBN.jl public API (`foreach_record_with_control`) and a Live struct field. Reconnect-path tests in `test_live_streaming.jl` need re-validation.
+### F2 — Linux re-benchmark  **[no longer required]**
 
-### F2 — Linux re-benchmark of `bench_live_reader.jl`
-
-The in-process pipeline runs at 8–10 M rec/s; through Windows TCP loopback we measure 50 k rec/s — a 200× gap. Hypothesis: the Windows kernel + libuv stack adds per-packet overhead that Linux's epoll-based libuv does not.
-
-Action: run `julia --project=benchmark -e 'include("benchmark/bench_live_reader.jl"); BenchLiveReader.run(tiers = (:small,))'` on a Linux host and compare. Expected outcomes:
-
-- **Linux ≥ 1 M rec/s**: confirms Windows-specific. F1 becomes clearly worth landing.
-- **Linux ≈ 50 k rec/s**: libuv backend is the bottleneck on both platforms. F1 still helps CPU usage but won't change wall-clock; treat as a CPU/alloc optimization rather than a throughput one. Worth investigating `unsafe_read` against `bytesavailable` to bypass libuv's per-call buffering.
-
-Cannot be done from the current Windows development host.
+The original motivation (200× Windows-vs-Linux gap) was a bench bug. The live reader does ~9 M rec/s on Windows TCP loopback post-fix. A Linux baseline is still nice-to-have for completeness but isn't blocking anything.
 
 ### F3 — Eliminate `Ref` boxing in `DBN.read_record`  (R4)
 
-**Current state:** after R1+R2, the only performance-sensitive callers of generic `read_record` are: the live reader (`src/live/reader.jl:49`) and `DBNStream`. The live reader is better served by F1 (a typed reader that doesn't go through `read_record` at all). `DBNStream` is doc-deprecated for high-throughput use (R6).
-
-**Recommendation:** **skip indefinitely**. Pursue only if a specific workload shows generic `read_record` as a measured hot spot AND F1 doesn't already cover it.
+**Skip indefinitely.** After R1+R2 + the bench-fix-revealed live reader is fine, no performance-sensitive caller of generic `read_record` remains. `DBNStream` is doc-deprecated for high-throughput (R6).
 
 ### F4 — `size_hint` kwarg on `get_range`  **[DONE]**
 
-`get_range(c; ..., size_hint = n)` now accepts an exact record-count bound from callers who have one (e.g. from a prior `get_record_count` call). When supplied, it overrides the default 8×-zstd-expansion heuristic, avoiding the 10–20% over-allocation. Tested with both `typed=true` and `typed=false`.
+`get_range(c; ..., size_hint = n)` accepts an exact record-count bound from callers who have one (e.g. from a prior `get_record_count` call). When supplied, it overrides the default 8×-zstd-expansion heuristic, avoiding the 10–20% over-allocation. Tested with both `typed=true` and `typed=false`.
 
 ---
 
