@@ -46,23 +46,34 @@ start. This is verbose but type-stable — each `put!(ch, rec)` is
 monomorphic, no dynamic dispatch per record.
 """
 function _reader_loop_typed(c::Live)
-    # Resolve channels per schema, typed concretely. `_typed_channel_or_nothing`
-    # returns `Channel{T}` for a subscribed schema and `nothing` otherwise.
-    ch_trades   = _typed_channel_or_nothing(c, DBN.TradeMsg)
-    ch_mbo      = _typed_channel_or_nothing(c, DBN.MBOMsg)
-    ch_mbp1     = _typed_channel_or_nothing(c, DBN.MBP1Msg)
-    ch_mbp10    = _typed_channel_or_nothing(c, DBN.MBP10Msg)
-    ch_ohlcv    = _typed_channel_or_nothing(c, DBN.OHLCVMsg)
-    ch_def      = _typed_channel_or_nothing(c, DBN.InstrumentDefMsg)
-    ch_status   = _typed_channel_or_nothing(c, DBN.StatusMsg)
-    ch_imbal    = _typed_channel_or_nothing(c, DBN.ImbalanceMsg)
-    ch_stat     = _typed_channel_or_nothing(c, DBN.StatMsg)
-    ch_cmbp1    = _typed_channel_or_nothing(c, DBN.CMBP1Msg)
-    ch_cbbo1s   = _typed_channel_or_nothing(c, DBN.CBBO1sMsg)
-    ch_cbbo1m   = _typed_channel_or_nothing(c, DBN.CBBO1mMsg)
-    ch_tcbbo    = _typed_channel_or_nothing(c, DBN.TCBBOMsg)
-    ch_bbo1s    = _typed_channel_or_nothing(c, DBN.BBO1sMsg)
-    ch_bbo1m    = _typed_channel_or_nothing(c, DBN.BBO1mMsg)
+    # Resolve channels per SCHEMA (not per record type) so subscriptions
+    # to schemas sharing a concrete record type get distinct channels.
+    # OHLCV_1S/1M/1H/1D all have type OHLCVMsg but different rtypes; we
+    # need a separate channel for each subscribed interval. TBBO uses the
+    # MBP1Msg layout (same as MBP_1) but is conceptually a different
+    # subscription. The dispatch tree below maps each rtype to the right
+    # per-schema channel, broadcasting only where a single rtype can
+    # legitimately serve multiple subscriptions (e.g. MBP_1 + TBBO both
+    # tagged MBP_1_MSG).
+    ch_trades    = _channel_for(c, Schema.TRADES,     DBN.TradeMsg)
+    ch_mbo       = _channel_for(c, Schema.MBO,        DBN.MBOMsg)
+    ch_mbp1      = _channel_for(c, Schema.MBP_1,      DBN.MBP1Msg)
+    ch_tbbo      = _channel_for(c, Schema.TBBO,       DBN.MBP1Msg)
+    ch_mbp10     = _channel_for(c, Schema.MBP_10,     DBN.MBP10Msg)
+    ch_ohlcv_1s  = _channel_for(c, Schema.OHLCV_1S,   DBN.OHLCVMsg)
+    ch_ohlcv_1m  = _channel_for(c, Schema.OHLCV_1M,   DBN.OHLCVMsg)
+    ch_ohlcv_1h  = _channel_for(c, Schema.OHLCV_1H,   DBN.OHLCVMsg)
+    ch_ohlcv_1d  = _channel_for(c, Schema.OHLCV_1D,   DBN.OHLCVMsg)
+    ch_def       = _channel_for(c, Schema.DEFINITION, DBN.InstrumentDefMsg)
+    ch_status    = _channel_for(c, Schema.STATUS,     DBN.StatusMsg)
+    ch_imbal     = _channel_for(c, Schema.IMBALANCE,  DBN.ImbalanceMsg)
+    ch_stat      = _channel_for(c, Schema.STATISTICS, DBN.StatMsg)
+    ch_cmbp1     = _channel_for(c, Schema.CMBP_1,     DBN.CMBP1Msg)
+    ch_cbbo1s    = _channel_for(c, Schema.CBBO_1S,    DBN.CBBO1sMsg)
+    ch_cbbo1m    = _channel_for(c, Schema.CBBO_1M,    DBN.CBBO1mMsg)
+    ch_tcbbo     = _channel_for(c, Schema.TCBBO,      DBN.TCBBOMsg)
+    ch_bbo1s     = _channel_for(c, Schema.BBO_1S,     DBN.BBO1sMsg)
+    ch_bbo1m     = _channel_for(c, Schema.BBO_1M,     DBN.BBO1mMsg)
 
     ctrl_chan = c.control_channel
 
@@ -87,38 +98,47 @@ function _reader_loop_typed(c::Live)
             end
 
             if hd_result isa Tuple
+                # Unknown rtype. `record_length` is in 4-byte units; the
+                # 2-byte header (length + rtype) is already consumed.
                 _, _, record_length = hd_result
-                skip(decoder.io, record_length - 2)
+                skip(decoder.io, Int(record_length) * DBN.LENGTH_MULTIPLIER - 2)
                 continue
             end
 
             hd = hd_result
             rt = hd.rtype
 
-            # Hot path: data-record rtypes, type-stable put!. The nullness
-            # check on the per-schema channel is FIRST in each branch so that
+            # Hot path: data-record rtypes, type-stable put! to the
+            # per-schema channel. Nullness check FIRST in each branch so
             # unsubscribed schemas short-circuit on a pointer comparison
-            # (~1 cycle) before the slower rtype enum comparison. For a
-            # single-schema subscription this collapses the 13 unsubscribed
-            # branches to 13 fast nothing-checks instead of 13 enum
-            # comparisons.
+            # before the slower rtype enum comparison.
             if ch_trades !== nothing && rt == DBN.RType.MBP_0_MSG
                 put!(ch_trades, DBN.read_trade_msg(decoder, hd))
                 continue
             elseif ch_mbo !== nothing && rt == DBN.RType.MBO_MSG
                 put!(ch_mbo, DBN.read_mbo_msg(decoder, hd))
                 continue
-            elseif ch_mbp1 !== nothing && rt == DBN.RType.MBP_1_MSG
-                put!(ch_mbp1, DBN.read_mbp1_msg(decoder, hd))
+            elseif (ch_mbp1 !== nothing || ch_tbbo !== nothing) && rt == DBN.RType.MBP_1_MSG
+                # MBP_1 and TBBO both use MBP_1_MSG rtype + MBP1Msg layout.
+                # Broadcast so each subscribed channel receives the record.
+                rec = DBN.read_mbp1_msg(decoder, hd)
+                ch_mbp1 !== nothing && put!(ch_mbp1, rec)
+                ch_tbbo !== nothing && put!(ch_tbbo, rec)
                 continue
             elseif ch_mbp10 !== nothing && rt == DBN.RType.MBP_10_MSG
                 put!(ch_mbp10, DBN.read_mbp10_msg(decoder, hd))
                 continue
-            elseif ch_ohlcv !== nothing && (rt == DBN.RType.OHLCV_1S_MSG ||
-                                            rt == DBN.RType.OHLCV_1M_MSG ||
-                                            rt == DBN.RType.OHLCV_1H_MSG ||
-                                            rt == DBN.RType.OHLCV_1D_MSG)
-                put!(ch_ohlcv, DBN.read_ohlcv_msg(decoder, hd))
+            elseif ch_ohlcv_1s !== nothing && rt == DBN.RType.OHLCV_1S_MSG
+                put!(ch_ohlcv_1s, DBN.read_ohlcv_msg(decoder, hd))
+                continue
+            elseif ch_ohlcv_1m !== nothing && rt == DBN.RType.OHLCV_1M_MSG
+                put!(ch_ohlcv_1m, DBN.read_ohlcv_msg(decoder, hd))
+                continue
+            elseif ch_ohlcv_1h !== nothing && rt == DBN.RType.OHLCV_1H_MSG
+                put!(ch_ohlcv_1h, DBN.read_ohlcv_msg(decoder, hd))
+                continue
+            elseif ch_ohlcv_1d !== nothing && rt == DBN.RType.OHLCV_1D_MSG
+                put!(ch_ohlcv_1d, DBN.read_ohlcv_msg(decoder, hd))
                 continue
             elseif ch_status !== nothing && rt == DBN.RType.STATUS_MSG
                 put!(ch_status, DBN.read_status_msg(decoder, hd))
@@ -193,15 +213,13 @@ function _reader_loop_typed(c::Live)
     return nothing
 end
 
-# Resolve the subscribed typed channel for a concrete record type, type-stable.
-# Returns `Channel{T}` if the matching schema was subscribed, else `nothing`.
-function _typed_channel_or_nothing(c::Live, ::Type{T}) where {T}
-    for (_, ch) in c.typed_data_channels
-        if ch isa Channel{T}
-            return ch::Channel{T}
-        end
-    end
-    return nothing
+# Resolve a SCHEMA-specific typed channel, type-stable.
+# Returns `Channel{T}` if the schema was subscribed (asserting T matches),
+# else `nothing`. Caller passes both the schema and its concrete record
+# type so the return narrows to `Channel{T}` for monomorphic put!.
+@inline function _channel_for(c::Live, schema::Schema.T, ::Type{T}) where {T}
+    ch = get(c.typed_data_channels, schema, nothing)
+    return ch === nothing ? nothing : ch::Channel{T}
 end
 
 function _reader_loop(c::Live)
