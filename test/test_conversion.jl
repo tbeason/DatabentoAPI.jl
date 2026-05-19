@@ -1,6 +1,7 @@
 using Test
 using DatabentoAPI
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 using DataFrames
 
 function _tiny_store()

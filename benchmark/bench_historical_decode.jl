@@ -4,7 +4,8 @@ include("fixtures.jl"); using .Fixtures
 include("bench_common.jl"); using .BenchCommon
 
 using DatabentoAPI
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 using HTTP
 using CodecZstd
 using TranscodingStreams

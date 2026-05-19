@@ -3,7 +3,8 @@
 
 Julia client for the Databento Historical (HTTP) and Live (TCP) market data APIs.
 
-Wraps Databento's wire protocols on top of [DBN.jl](https://github.com/tylerbeason/DBN.jl),
+Wraps Databento's wire protocols on top of
+[DatabentoBinaryEncoding.jl](https://github.com/tbeason/DatabentoBinaryEncoding.jl),
 which handles all binary record decoding.
 
 # Quick start
@@ -49,8 +50,8 @@ using TOML
 using TranscodingStreams
 using URIs
 
-import DBN
-using DBN: Schema, SType, Compression, Encoding, Action, Side, InstrumentClass
+import DatabentoBinaryEncoding as DBN
+using DatabentoBinaryEncoding: Schema, SType, Compression, Encoding, Action, Side, InstrumentClass
 
 include("errors.jl")
 include("enums.jl")
@@ -74,7 +75,7 @@ include("live/subscribe.jl")
 include("live/heartbeat.jl")
 include("live/streaming.jl")
 
-# Re-exported DBN.jl enums (single import for users)
+# Re-exported DatabentoBinaryEncoding enums (single import for users)
 export Schema, SType, Compression, Encoding, Action, Side, InstrumentClass
 
 # DatabentoAPI-specific enums

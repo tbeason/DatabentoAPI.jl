@@ -17,7 +17,8 @@ module BenchTCPThroughput
 #      buffer would lift the live ceiling.
 
 using Sockets
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 using DatabentoAPI: CountingIO
 using Printf
 

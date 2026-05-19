@@ -1,6 +1,7 @@
 using Test
 using DatabentoAPI
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 
 @testset "Live streaming smoke (OPRA.PILLAR)" begin
     base = mktempdir()

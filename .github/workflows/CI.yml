@@ -28,17 +28,18 @@ jobs:
 
       - uses: julia-actions/cache@v3
 
-      # DBN.jl is unregistered — clone it as a sibling and develop it before testing.
-      - name: Clone DBN.jl
+      # DatabentoBinaryEncoding.jl is unregistered — clone it as a sibling and
+      # develop it before testing.
+      - name: Clone DatabentoBinaryEncoding.jl
         shell: bash
-        run: git clone --depth 1 https://github.com/tbeason/DBN.jl ../DBN.jl
+        run: git clone --depth 1 https://github.com/tbeason/DatabentoBinaryEncoding.jl ../DatabentoBinaryEncoding.jl
 
-      - name: Dev DBN.jl + instantiate
+      - name: Dev DatabentoBinaryEncoding.jl + instantiate
         shell: bash
         run: |
           julia --project=. -e '
             using Pkg
-            Pkg.develop(path="../DBN.jl")
+            Pkg.develop(path="../DatabentoBinaryEncoding.jl")
             Pkg.instantiate()
           '
 

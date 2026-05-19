@@ -3,7 +3,8 @@ using DatabentoAPI
 using HTTP
 using CodecZstd
 using TranscodingStreams
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 
 # Build a small in-memory DBN file (uncompressed), then zstd-compress, and serve it
 # from the mock dispatcher to exercise the full get_range pipeline.

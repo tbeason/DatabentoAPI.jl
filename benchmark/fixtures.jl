@@ -1,6 +1,7 @@
 module Fixtures
 
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 using CodecZstd
 using TranscodingStreams
 
