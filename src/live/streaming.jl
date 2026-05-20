@@ -63,6 +63,23 @@ mutable struct RotatingDBNFile
     rotations::Int
     all_paths::Vector{String}
     write_lock::ReentrantLock
+    # Sidecar JSONL file capturing SymbolMappingMsg events. Rotates alongside
+    # the main DBN file. We don't write mappings into the .dbn.zst itself
+    # because the live gateway emits them in v1 layout (80 bytes) while our
+    # file metadata is v3 — DBN.jl's encoder would write them as v3 (~180
+    # bytes) with the wire hd.length=20, corrupting the file. JSONL sidecar
+    # avoids that mismatch entirely and is human-readable / easy to join.
+    sidecar_io::Union{Nothing,IO}
+    sidecar_path::String
+    sidecar_paths::Vector{String}
+    # In-file zstd frame rotation for crash safety. Every `frame_seconds`,
+    # close the current zstd frame (writes footer to raw_io) and open a new
+    # one on the same file. Multi-frame .dbn.zst is standards-compliant to
+    # any zstd reader, so a hard kill loses ≤ one frame of records rather
+    # than corrupting the whole file. `nothing` disables it (single frame).
+    frame_seconds::Union{Nothing,Float64}
+    frame_opened_at::Float64
+    frame_count::Int
 end
 
 function RotatingDBNFile(; base_dir::AbstractString,
@@ -73,7 +90,8 @@ function RotatingDBNFile(; base_dir::AbstractString,
                           stype_in::SType.T,
                           compress::Bool,
                           compress_level::Integer,
-                          rotate_seconds::Union{Nothing,Real})
+                          rotate_seconds::Union{Nothing,Real},
+                          frame_seconds::Union{Nothing,Real} = nothing)
     syms_vec = symbols isa AbstractString ? [String(symbols)] : String.(symbols)
     f = RotatingDBNFile(
         String(base_dir),
@@ -82,9 +100,21 @@ function RotatingDBNFile(; base_dir::AbstractString,
         compress, Int(compress_level),
         rotate_seconds === nothing ? nothing : Float64(rotate_seconds),
         nothing, nothing, nothing, "", 0.0, 0, String[], ReentrantLock(),
+        nothing, "", String[],
+        frame_seconds === nothing ? nothing : Float64(frame_seconds),
+        0.0, 0,
     )
     _open!(f)
     return f
+end
+
+# Sidecar path mirrors the main DBN file, swapping .dbn[.zst] for
+# .symbology.jsonl. Lives in the same per-schema directory.
+function _sidecar_path_for(dbn_path::AbstractString)
+    p = String(dbn_path)
+    base = endswith(p, ".dbn.zst") ? p[1:end-8] :
+           endswith(p, ".dbn")     ? p[1:end-4] : p
+    return base * ".symbology.jsonl"
 end
 
 function _next_path(f::RotatingDBNFile)
@@ -117,13 +147,52 @@ function _open!(f::RotatingDBNFile)
     )
     enc = DBN.DBNEncoder(top, md)
     DBN.write_header(enc)
-    f.raw_io       = raw
-    f.zstd_io      = top
-    f.encoder      = enc
-    f.current_path = path
-    f.opened_at    = time()
+    f.raw_io          = raw
+    f.zstd_io         = top
+    f.encoder         = enc
+    f.current_path    = path
+    f.opened_at       = time()
+    f.frame_opened_at = time()  # first frame opens with the file
     push!(f.all_paths, path)
+    # Open the symbology sidecar alongside the DBN file.
+    sc_path = _sidecar_path_for(path)
+    f.sidecar_io   = open(sc_path, "w")
+    f.sidecar_path = sc_path
+    push!(f.sidecar_paths, sc_path)
     return nothing
+end
+
+# In-file zstd frame rotation. Writes TranscodingStreams' TOKEN_END through
+# the active zstd stream + flushes, which makes the codec emit the zstd
+# frame footer to raw_io. Subsequent writes start a fresh frame on the
+# same stream — the resulting .dbn.zst is a multi-frame zstd file, fully
+# standards-compliant. DBN-level layout is unaffected: the metadata
+# header was written once at file open, and the decompressed output is
+# concatenated across frames, so readers see "header then records".
+#
+# Crucially this does NOT close the underlying TranscodingStream (which
+# would also close raw_io), and does NOT recreate the DBN encoder — same
+# instance keeps working across the frame boundary.
+function _rotate_frame_if_needed!(f::RotatingDBNFile)
+    f.frame_seconds === nothing && return false
+    f.compress                  || return false   # only meaningful for compressed files
+    # Acquire write_lock so we can be called either from _write_record!
+    # (already-held lock; ReentrantLock allows reentrance) or from the
+    # session monitor (separate task, lock-free entry point).
+    return lock(f.write_lock) do
+        (time() - f.frame_opened_at) < f.frame_seconds && return false
+        f.zstd_io === nothing && return false   # file closed concurrently
+        try
+            write(f.zstd_io, TranscodingStreams.TOKEN_END)
+            flush(f.zstd_io)
+        catch e
+            @warn "frame rotation: writing frame footer raised" schema=f.schema exception=e
+            return false
+        end
+        f.frame_opened_at = time()
+        f.frame_count    += 1
+        return true
+    end
 end
 
 function _close_stack!(f::RotatingDBNFile)
@@ -143,9 +212,14 @@ function _close_stack!(f::RotatingDBNFile)
         f.raw_io === nothing || close(f.raw_io)
     catch
     end
-    f.encoder = nothing
-    f.zstd_io = nothing
-    f.raw_io  = nothing
+    try
+        f.sidecar_io === nothing || (flush(f.sidecar_io); close(f.sidecar_io))
+    catch
+    end
+    f.encoder    = nothing
+    f.zstd_io    = nothing
+    f.raw_io     = nothing
+    f.sidecar_io = nothing
     return nothing
 end
 
@@ -162,7 +236,9 @@ end
 
 function _write_record!(f::RotatingDBNFile, rec)
     lock(f.write_lock) do
-        _rotate_if_needed!(f)
+        # File rotation (new .dbn.zst) takes precedence over frame rotation:
+        # if we just opened a fresh file, its zstd frame is brand new anyway.
+        _rotate_if_needed!(f) || _rotate_frame_if_needed!(f)
         DBN.write_record(f.encoder, rec)
     end
     return nothing
@@ -170,13 +246,39 @@ end
 
 function _flush!(f::RotatingDBNFile)
     lock(f.write_lock) do
-        f.zstd_io === nothing || flush(f.zstd_io)
-        f.raw_io  === nothing || flush(f.raw_io)
+        f.zstd_io    === nothing || flush(f.zstd_io)
+        f.raw_io     === nothing || flush(f.raw_io)
+        f.sidecar_io === nothing || flush(f.sidecar_io)
     end
     return nothing
 end
 
 _close!(f::RotatingDBNFile) = lock(() -> _close_stack!(f), f.write_lock)
+
+# Append one JSON line per SymbolMappingMsg to the sidecar. Held under the
+# same write_lock as DBN writes so it can't race with a rotation.
+function _append_symbology!(f::RotatingDBNFile, rec::DBN.SymbolMappingMsg)
+    lock(f.write_lock) do
+        f.sidecar_io === nothing && return nothing
+        m = (
+            ts_event         = rec.hd.ts_event,
+            instrument_id    = rec.hd.instrument_id,
+            stype_in         = string(Symbol(rec.stype_in)),
+            stype_in_symbol  = rec.stype_in_symbol,
+            stype_out        = string(Symbol(rec.stype_out)),
+            stype_out_symbol = rec.stype_out_symbol,
+            start_ts         = rec.start_ts,
+            end_ts           = rec.end_ts,
+        )
+        JSON3.write(f.sidecar_io, m)
+        write(f.sidecar_io, '\n')
+        # Mappings are sparse (one per (schema, instrument) at subscribe time,
+        # then occasional updates). Flushing per-line is cheap and means a
+        # crashed capture still has a recoverable, complete sidecar.
+        flush(f.sidecar_io)
+    end
+    return nothing
+end
 
 # ---------- session context ----------
 
@@ -258,18 +360,15 @@ function _handle_data!(ctx::SessionContext, rec)
 end
 
 # Control-record path: SymbolMappingMsg / SystemMsg / ErrorMsg.
-# Counts + special handling per type. Never written to disk (mappings
-# break round-trip due to v1/v3 layout drift; system/error are noise).
+# Counts + special handling per type. SymbolMappingMsg goes to the per-file
+# JSONL sidecar (not the .dbn.zst, because gateway emits v1-layout records
+# that DBN.jl's v3 encoder would corrupt the file with). SystemMsg/ErrorMsg
+# are just counted/logged.
 function _handle_control!(ctx::SessionContext, rec)
     s = ctx.stats
     if rec isa DBN.SymbolMappingMsg
-        # Don't write SymbolMappingMsg to disk: live gateway sends v1-layout
-        # records (80 bytes) but our file metadata is v3, so DBN.jl's encoder
-        # would write them as v3 (~180 bytes) with the original hd.length=20,
-        # desyncing the file. Schema-pure files are the simplest fix; if the
-        # caller needs instrument_id → raw_symbol resolution, use the
-        # `symbology.resolve` historical endpoint with the same symbols.
         s.mapping_count += 1
+        _append_symbology!(ctx.file, rec)
     elseif rec isa DBN.SystemMsg
         s.system_count += 1
         is_heartbeat(rec) || @debug "SystemMsg" schema=ctx.schema msg=rec.msg
@@ -436,8 +535,40 @@ function _session_monitor(ctx::SessionContext, interval_s::Float64,
         if isopen(ctx.flush_request) && !isready(ctx.flush_request)
             try; put!(ctx.flush_request, nothing); catch; end
         end
+        # Directly flush + rotate frame from the monitor task. This is the
+        # only mechanism that fires for QUIET schemas — _write_record! only
+        # runs when records arrive, and the session loop blocks on take!
+        # when the data channel is empty. Without this, a quiet schema's
+        # in-memory zstd buffer (including the DBN metadata header) never
+        # reaches disk and a hard kill loses the entire file.
+        try; _flush!(ctx.file); catch; end
+        try; _rotate_frame_if_needed!(ctx.file); catch; end
         last_count = cur
         last_tick  = now
+    end
+    return nothing
+end
+
+# ---------- sentinel watcher ----------
+
+# Polls for the existence of `sentinel_path` once per second. On detection,
+# calls _request_shutdown! on every context so the capture exits cleanly
+# through its finally → _close_stack! path (no truncated zstd frames).
+# Removes the sentinel after triggering so a leftover file doesn't cause
+# the next launch to shut down immediately.
+function _watch_sentinel(contexts, sentinel_path::String, stop::Threads.Atomic{Bool})
+    while !stop[]
+        try
+            if isfile(sentinel_path)
+                @info "stop sentinel detected — initiating clean shutdown" path=sentinel_path
+                for ctx in contexts; _request_shutdown!(ctx); end
+                try; rm(sentinel_path; force = true); catch; end
+                return nothing
+            end
+        catch e
+            @warn "sentinel watcher error" exception=e
+        end
+        sleep(1.0)
     end
     return nothing
 end
@@ -491,6 +622,8 @@ function stream_to_file(; schema::Schema.T,
                         compress::Bool = true,
                         compress_level::Integer = 1,
                         rotate_seconds::Union{Nothing,Real} = nothing,
+                        frame_seconds::Union{Nothing,Real} = 60.0,
+                        stop_sentinel::Union{Nothing,AbstractString} = nothing,
                         reconnect::Bool = true,
                         key = nothing,
                         gateway = nothing,
@@ -508,12 +641,24 @@ function stream_to_file(; schema::Schema.T,
         dataset = dataset, schema = schema, symbols = symbols, stype_in = stype_in,
         compress = compress, compress_level = compress_level,
         rotate_seconds = path === nothing ? rotate_seconds : nothing,
+        frame_seconds = frame_seconds,
     )
     ctx = SessionContext(schema, SessionStats(schema = schema), file)
 
     deadline = duration_s === nothing ? nothing : time() + Float64(duration_s)
     monitor_stop = Threads.Atomic{Bool}(false)
     monitor_task = @async _session_monitor(ctx, Float64(heartbeat_log_interval_s), monitor_stop)
+
+    sentinel = stop_sentinel === nothing ? joinpath(base, "STOP") : String(stop_sentinel)
+    # Stale sentinel from a previous killed run would trigger immediate
+    # shutdown — clear it on startup so the watcher only fires on a fresh
+    # touch from this session onward.
+    if isfile(sentinel)
+        @warn "removing leftover stop sentinel" path=sentinel
+        try; rm(sentinel; force = true); catch; end
+    end
+    sentinel_stop = Threads.Atomic{Bool}(false)
+    sentinel_task = @async _watch_sentinel((ctx,), sentinel, sentinel_stop)
 
     try
         _run_session(ctx;
@@ -528,7 +673,9 @@ function stream_to_file(; schema::Schema.T,
         )
     finally
         monitor_stop[] = true
+        sentinel_stop[] = true
         try; istaskdone(monitor_task) || sleep(0.1); catch; end
+        try; istaskdone(sentinel_task) || sleep(0.1); catch; end
         _close!(file)
     end
     return ctx.file.current_path
@@ -561,6 +708,8 @@ function stream_multi_to_files(; schemas::AbstractVector,
                                compress::Bool = true,
                                compress_level::Integer = 1,
                                rotate_seconds::Union{Nothing,Real} = nothing,
+                               frame_seconds::Union{Nothing,Real} = 60.0,
+                               stop_sentinel::Union{Nothing,AbstractString} = nothing,
                                reconnect::Bool = true,
                                key = nothing,
                                gateway = nothing,
@@ -585,6 +734,7 @@ function stream_multi_to_files(; schemas::AbstractVector,
             dataset = dataset, schema = sch, symbols = symbols, stype_in = stype_in,
             compress = compress, compress_level = compress_level,
             rotate_seconds = rotate_seconds,
+            frame_seconds = frame_seconds,
         )
         contexts[sch] = SessionContext(sch, SessionStats(schema = sch), file)
     end
@@ -612,6 +762,14 @@ function stream_multi_to_files(; schemas::AbstractVector,
         end
     end
 
+    sentinel = stop_sentinel === nothing ? joinpath(base, "STOP") : String(stop_sentinel)
+    if isfile(sentinel)
+        @warn "removing leftover stop sentinel" path=sentinel
+        try; rm(sentinel; force = true); catch; end
+    end
+    sentinel_stop = Threads.Atomic{Bool}(false)
+    sentinel_task = @async _watch_sentinel(values(contexts), sentinel, sentinel_stop)
+
     try
         while any(!istaskdone(t) for t in values(worker_tasks))
             sleep(_CONNECTION_POLL_S)
@@ -636,9 +794,11 @@ function stream_multi_to_files(; schemas::AbstractVector,
         end
     end
     for s in keys(monitor_stops); monitor_stops[s][] = true; end
+    sentinel_stop[] = true
     for t in values(monitor_tasks)
         try; istaskdone(t) || sleep(0.1); catch; end
     end
+    try; istaskdone(sentinel_task) || sleep(0.1); catch; end
 
     out = Dict{Schema.T,String}()
     for (sch, ctx) in contexts
