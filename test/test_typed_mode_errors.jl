@@ -1,6 +1,7 @@
 using Test
 using DatabentoAPI
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 
 @testset "typed mode — error coverage" begin
 

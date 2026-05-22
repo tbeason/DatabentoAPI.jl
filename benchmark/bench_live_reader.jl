@@ -5,7 +5,8 @@ include("bench_common.jl"); using .BenchCommon
 
 using DatabentoAPI
 using DatabentoAPI: read_text_frame, build_text_frame, cram_response
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 using CodecZstd
 using TranscodingStreams
 using Sockets

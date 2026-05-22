@@ -3,7 +3,8 @@ module BenchDBNWrite
 include("fixtures.jl"); using .Fixtures
 include("bench_common.jl"); using .BenchCommon
 
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 using CodecZstd
 using TranscodingStreams
 

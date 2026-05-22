@@ -1,7 +1,8 @@
 using Test
 using DatabentoAPI
 using DatabentoAPI: read_text_frame, build_text_frame
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 using Sockets
 
 const TEST_API_KEY_2 = "db-aaaaaaaaaaaaaaa12345"

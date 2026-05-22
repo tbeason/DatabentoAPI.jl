@@ -8,7 +8,8 @@ module ProfileLiveReader
 include("fixtures.jl"); using .Fixtures
 
 using DatabentoAPI
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 using Profile
 using Printf
 using CodecZstd

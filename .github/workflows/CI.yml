@@ -28,20 +28,6 @@ jobs:
 
       - uses: julia-actions/cache@v3
 
-      # DBN.jl is unregistered — clone it as a sibling and develop it before testing.
-      - name: Clone DBN.jl
-        shell: bash
-        run: git clone --depth 1 https://github.com/tbeason/DBN.jl ../DBN.jl
-
-      - name: Dev DBN.jl + instantiate
-        shell: bash
-        run: |
-          julia --project=. -e '
-            using Pkg
-            Pkg.develop(path="../DBN.jl")
-            Pkg.instantiate()
-          '
-
       - uses: julia-actions/julia-buildpkg@v1
 
       - uses: julia-actions/julia-runtest@v1

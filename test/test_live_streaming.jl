@@ -4,7 +4,8 @@ using DatabentoAPI: SessionStats, RotatingDBNFile, SessionContext,
                     _is_bbo_family, _replay_start_ts, _log_status_alarm!,
                     _handle_record!, _open!, _close!,
                     _ALARM_STATUS_ACTIONS, _SPARSE_SCHEMAS
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 using Sockets
 using CodecZstd
 using TranscodingStreams

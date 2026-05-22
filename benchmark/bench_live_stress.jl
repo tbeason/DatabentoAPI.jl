@@ -12,7 +12,8 @@ module BenchLiveStress
 # subscription.
 
 using DatabentoAPI
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 using Printf
 
 const DEFAULT_PARENTS = [

@@ -6,8 +6,8 @@ authors = ["Tyler Beason <tbeas12@gmail.com>"]
 [deps]
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 CodecZstd = "6b39b394-51ab-5f42-8807-6242bab2b4c2"
-DBN = "90689371-c8cb-40d1-831f-18033db90f74"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+DatabentoBinaryEncoding = "90689371-c8cb-40d1-831f-18033db90f74"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 EnumX = "4e289a0a-7415-4d19-859d-a7e5c4648b56"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
@@ -19,13 +19,10 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 URIs = "5c2747f8-b7ea-4ff2-ba2e-563bfd36b1d4"
 
-[sources]
-DBN = {path = "C:\\Users\\tbeas\\Documents\\GitHub\\DBN.jl"}
-
 [compat]
 CodecZstd = "0.8"
-DBN = "0.1"
 DataFrames = "1.7"
+DatabentoBinaryEncoding = "0.1"
 EnumX = "1.0"
 HTTP = "1.10"
 JSON3 = "1.14"

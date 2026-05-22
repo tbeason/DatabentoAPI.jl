@@ -1,7 +1,8 @@
 using Test
 using DatabentoAPI
 using DatabentoAPI: read_text_frame, build_text_frame, cram_response
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 using Sockets
 
 # Encode a tiny DBN payload (header + 3 trades) as raw bytes.

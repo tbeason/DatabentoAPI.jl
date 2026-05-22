@@ -3,7 +3,8 @@ module ProfileHotspots
 include("fixtures.jl"); using .Fixtures
 
 using Profile
-using DBN
+using DatabentoBinaryEncoding
+import DatabentoBinaryEncoding as DBN
 using CodecZstd
 using TranscodingStreams
 using Printf
