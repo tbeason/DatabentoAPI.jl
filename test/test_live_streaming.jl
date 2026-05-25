@@ -40,6 +40,56 @@ function _make_dbn_bytes_with_trades(n::Int; dataset = "TEST.MOCK")
     end
 end
 
+# Interleaved trades + status payload for multi-schema-on-one-Live testing.
+function _make_dbn_bytes_with_trades_and_status(; n_trades::Int = 4, n_status::Int = 2,
+                                                dataset = "TEST.MOCK")
+    metadata = DBN.Metadata(
+        DBN.DBN_VERSION, dataset, DBN.Schema.TRADES,
+        Int64(0), nothing, nothing, nothing,
+        DBN.SType.INSTRUMENT_ID, false,
+        ["AAPL"], String[], String[],
+        Tuple{String,String,Int64,Int64}[],
+    )
+    records = DBN.DBNRecord[]
+    ts_base = Int64(1_700_000_000_000_000_000)
+    # Interleave: trade, status, trade, status, trade, trade, ...
+    total = n_trades + n_status
+    ti = 0; si = 0
+    for k in 1:total
+        emit_status = si < n_status && (k % 2 == 0)
+        if emit_status
+            si += 1
+            iid = UInt32(7000 + si)
+            hd = DBN.RecordHeader(UInt8(0), DBN.RType.STATUS_MSG,
+                                  UInt16(1), iid,
+                                  ts_base + Int64(k) * Int64(1_000_000))
+            push!(records, DBN.StatusMsg(
+                hd, UInt64(ts_base + Int64(k) * Int64(1_000_000)),
+                UInt16(2), UInt16(0), UInt16(0),  # action=open, reason=0, evt=0
+                UInt8('Y'), UInt8('N'), UInt8(0),
+            ))
+        else
+            ti += 1
+            iid = UInt32(100 + ti)
+            hd = DBN.RecordHeader(UInt8(0), DBN.RType.MBP_0_MSG,
+                                  UInt16(1), iid,
+                                  ts_base + Int64(k) * Int64(1_000_000))
+            push!(records, DBN.TradeMsg(
+                hd, Int64(150_000_000_000 + ti * 1_000_000), UInt32(100),
+                DBN.Action.TRADE, DBN.Side.ASK, UInt8(0), UInt8(1),
+                ts_base + Int64(k) * Int64(1_000_000), Int32(0), UInt32(ti),
+            ))
+        end
+    end
+    tmp, io = mktemp(); close(io)
+    try
+        DBN.write_dbn(tmp, metadata, records)
+        return read(tmp), n_trades, n_status
+    finally
+        rm(tmp; force = true)
+    end
+end
+
 const _TEST_KEY = "db-1234567890abcdef12345"
 
 # ---------- unit tests ----------
@@ -238,5 +288,55 @@ end
         end
     finally
         rm(tmp; force = true)
+    end
+end
+
+# ---------- multi-schema, single Live, schema-routed files ----------
+
+@testset "live streaming — multi-schema unified Live routes to per-schema files" begin
+    bytes, n_trades, n_status = _make_dbn_bytes_with_trades_and_status(
+        n_trades = 4, n_status = 2, dataset = "TEST.MOCK")
+    handshake = function (sock)
+        write(sock, build_text_frame(lsg_version = "0.9.0"))
+        write(sock, build_text_frame(cram = "challenge"))
+        flush(sock)
+        read_text_frame(sock)                                 # auth
+        write(sock, build_text_frame(success = "1", session_id = "sess-1"))
+        flush(sock)
+        # Two subscribe frames (one per schema), then start_session.
+        read_text_frame(sock)
+        read_text_frame(sock)
+        read_text_frame(sock)
+        write(sock, bytes)
+        flush(sock)
+        sleep(0.4)
+    end
+    mock = spawn_mock_gateway(handshake)
+    mktempdir() do dir
+        paths = DatabentoAPI.stream_multi_to_files(
+            schemas  = [Schema.TRADES, Schema.STATUS],
+            symbols  = ["AAPL"],
+            dataset  = "TEST.MOCK",
+            stype_in = SType.RAW_SYMBOL,
+            base_dir = dir,
+            compress = true,
+            duration_s = 4, reconnect = false,
+            key = _TEST_KEY, gateway = "127.0.0.1", port = mock.port,
+            wire_compression = Compression.NONE,
+            heartbeat_log_interval_s = 1.0,
+        )
+        try; wait(mock.accept_task) catch end
+        @test haskey(paths, Schema.TRADES)
+        @test haskey(paths, Schema.STATUS)
+        @test isfile(paths[Schema.TRADES])
+        @test isfile(paths[Schema.STATUS])
+
+        trade_recs = DBN.read_dbn(paths[Schema.TRADES])
+        @test length(trade_recs) == n_trades
+        @test all(r -> r isa DBN.TradeMsg, trade_recs)
+
+        status_recs = DBN.read_dbn(paths[Schema.STATUS])
+        @test length(status_recs) == n_status
+        @test all(r -> r isa DBN.StatusMsg, status_recs)
     end
 end

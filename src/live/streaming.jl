@@ -1,18 +1,31 @@
 # Multi-schema live capture to compressed DBN files.
 #
-# Each schema gets its own Live client, reader task, monitor task, and output
-# file. Records flow:
+# Single Live, typed channels, schema-routed files. Records flow:
 #
-#     gateway → Live.channel → _run_session loop → _handle_record! → DBNEncoder
+#     gateway
+#       └── 1 Live(typed=true)
+#            ├── subscribe!(schema=A) → Channel{TA} ── consumer_A → file_A
+#            ├── subscribe!(schema=B) → Channel{TB} ── consumer_B → file_B
+#            └── control_channel               ── ctrl_drainer → per-schema SessionStats
 #
-# A separate monitor task wakes every `heartbeat_log_interval_s` to log
-# throughput and request a flush via `ctx.flush_request` (serviced on the
-# consumer task under the file lock).
+# One TCP connection serves all schemas; the gateway dedupes SymbolMappingMsg
+# within a connection (~50% fewer mapping records than the per-schema-Live
+# design we used to have). A monitor task per schema wakes every
+# `heartbeat_log_interval_s` to log throughput and request a flush via
+# `ctx.flush_request` (serviced from the main coordination loop under the
+# file lock).
 #
-# Reconnect: on TCP drop, re-build the Live and resubscribe with `start =`
-# the lowest per-instrument timestamp seen so far (ts_recv for BBO families,
-# ts_event otherwise), bounded to within Databento's 24h replay window.
-# `ErrorMsg` from the gateway is treated as terminal (no reconnect).
+# Reconnect: on TCP drop, rebuild the Live and re-subscribe every schema with
+# its own `start =` the lowest per-instrument timestamp seen so far (ts_recv
+# for BBO families, ts_event otherwise), bounded to within Databento's 24h
+# replay window. `ErrorMsg` from the gateway is treated as terminal for all
+# schemas on this connection (no reconnect).
+#
+# Head-of-line caveat: the reader task `put!`s to each schema's typed channel
+# in turn. If consumer N's disk write falls behind enough to fill its
+# channel_size buffer, reader stalls the TCP socket for every schema. Default
+# channel_size=10_000 is generally enough headroom; tune up for very bursty
+# schemas paired with a slow archive disk.
 
 const _RECONNECT_WAIT_S        = 1.0
 const _STALE_THRESHOLD_S       = 30.0
@@ -294,7 +307,7 @@ function _handle_record!(ctx::SessionContext, rec)
     return nothing
 end
 
-# ---------- per-schema reconnect loop ----------
+# ---------- unified reconnect loop (1 Live, N schemas, N files) ----------
 
 function _bound_replay(start_ts)
     start_ts === nothing && return nothing
@@ -307,31 +320,69 @@ function _bound_replay(start_ts)
     return max(ts_ns, now_ns - _REPLAY_WINDOW_NS)
 end
 
-function _run_session(ctx::SessionContext;
-                     dataset::AbstractString,
-                     stype_in::SType.T,
-                     symbols,
-                     reconnect::Bool,
-                     deadline::Union{Nothing,Float64},
-                     key, gateway, port::Integer,
-                     wire_compression::Compression.T,
-                     heartbeat_interval, slow_reader_behavior,
-                     channel_size::Integer,
-                     start_initial,
-                     snapshot::Bool)
+_any_shutdown(ctxs) = any(c -> c.shutdown_requested[], values(ctxs))
+_any_error(ctxs)    = any(c -> c.stats.error !== nothing, values(ctxs))
+
+# Per-schema data drainer: pulls from this schema's typed channel and writes
+# to its file. Exits on channel close, shutdown, deadline, or terminal error.
+function _drain_data!(ctx::SessionContext, ch, deadline)
+    try
+        while true
+            rec = try
+                take!(ch)
+            catch e
+                e isa InvalidStateException && break
+                rethrow()
+            end
+            _handle_data!(ctx, rec)
+            ctx.shutdown_requested[]                   && break
+            deadline !== nothing && time() >= deadline && break
+            ctx.stats.error !== nothing                && break
+        end
+    catch e
+        if !(e isa InvalidStateException) && !ctx.shutdown_requested[]
+            @warn "data drainer error" schema=ctx.schema exception=(e, catch_backtrace())
+        end
+    end
+    return nothing
+end
+
+# Shared control drainer: broadcasts each control record to every ctx so
+# per-schema stats (mapping_count, system_count, error) stay comparable
+# regardless of how many schemas share this Live.
+function _drain_control!(ctxs::Dict{Schema.T,SessionContext}, ctrl_ch)
+    try
+        for rec in ctrl_ch
+            for ctx in values(ctxs)
+                _handle_control!(ctx, rec)
+            end
+        end
+    catch e
+        if !(e isa InvalidStateException)
+            @warn "control drainer error" exception=(e, catch_backtrace())
+        end
+    end
+    return nothing
+end
+
+function _run_unified_session(ctxs::Dict{Schema.T,SessionContext};
+                              dataset::AbstractString,
+                              stype_in::SType.T,
+                              symbols,
+                              reconnect::Bool,
+                              deadline::Union{Nothing,Float64},
+                              key, gateway, port::Integer,
+                              wire_compression::Compression.T,
+                              heartbeat_interval, slow_reader_behavior,
+                              channel_size::Integer,
+                              start_initial,
+                              snapshot::Bool)
+    # Stable subscribe! order so reconnect re-subscribes in the same sequence.
+    schemas = sort!(collect(keys(ctxs)); by = s -> Int(s))
     while true
-        ctx.shutdown_requested[] && return
-        deadline !== nothing && time() >= deadline && return
+        _any_shutdown(ctxs)                              && return
+        deadline !== nothing && time() >= deadline       && return
 
-        start_ts = ctx.stats.reconnects == 0 ? start_initial :
-                                               _replay_start_ts(ctx.stats, ctx.schema)
-        start_ts = _bound_replay(start_ts)
-
-        # typed=true: the reader splits data records (concrete type, typed
-        # Channel{T}) from control records (Union, control_channel). Two
-        # consumer paths inside this iteration of the reconnect loop:
-        #   - main loop drains `data_ch` and writes records to file
-        #   - a control-drainer task drains control_channel and updates stats
         client = Live(key;
             dataset = String(dataset),
             gateway = gateway, port = port,
@@ -342,69 +393,76 @@ function _run_session(ctx::SessionContext;
             channel_size = channel_size,
             typed = true,
         )
-        ctx.current_client = client
+        for ctx in values(ctxs); ctx.current_client = client; end
+
+        data_channels  = Dict{Schema.T,Any}()
+        consumer_tasks = Dict{Schema.T,Task}()
         ctrl_drainer::Union{Nothing,Task} = nothing
         try
             connect!(client)
-            data_ch = subscribe!(client;
-                schema = ctx.schema, symbols = symbols,
-                stype_in = stype_in, snapshot = snapshot, start = start_ts)
+            for sch in schemas
+                ctx = ctxs[sch]
+                start_ts = ctx.stats.reconnects == 0 ? start_initial :
+                                                      _replay_start_ts(ctx.stats, sch)
+                start_ts = _bound_replay(start_ts)
+                data_channels[sch] = subscribe!(client;
+                    schema   = sch,
+                    symbols  = symbols,
+                    stype_in = stype_in,
+                    snapshot = snapshot,
+                    start    = start_ts,
+                )
+            end
             start!(client)
 
-            ctrl_drainer = @async begin
-                try
-                    for rec in control_channel(client)
-                        _handle_control!(ctx, rec)
-                    end
-                catch e
-                    if !(e isa InvalidStateException) && !ctx.shutdown_requested[]
-                        @warn "control drainer error" schema=ctx.schema exception=(e, catch_backtrace())
-                    end
-                end
+            ctrl_drainer = @async _drain_control!(ctxs, control_channel(client))
+            for sch in schemas
+                ctx = ctxs[sch]
+                ch  = data_channels[sch]
+                consumer_tasks[sch] = @async _drain_data!(ctx, ch, deadline)
             end
 
+            # Main coordination loop: poll for shutdown/deadline/error and
+            # service per-schema flush requests. Exits when every consumer
+            # task has finished (reader closed all channels) or the loop is
+            # told to stop.
             try
-                while true
-                    rec = try
-                        take!(data_ch)
-                    catch e
-                        e isa InvalidStateException && break
-                        rethrow()
+                while !all(istaskdone, values(consumer_tasks))
+                    _any_shutdown(ctxs)                              && break
+                    deadline !== nothing && time() >= deadline       && break
+                    _any_error(ctxs)                                 && break
+                    for ctx in values(ctxs)
+                        while isready(ctx.flush_request)
+                            try; take!(ctx.flush_request); catch; end
+                            _flush!(ctx.file)
+                        end
                     end
-                    _handle_data!(ctx, rec)
-                    ctx.shutdown_requested[] && break
-                    deadline !== nothing && time() >= deadline && break
-                    # Bail fast if the control drainer flagged a terminal
-                    # ErrorMsg — no point reading more data records.
-                    ctx.stats.error !== nothing && break
-                    while isready(ctx.flush_request)
-                        try; take!(ctx.flush_request); catch; end
-                        _flush!(ctx.file)
-                    end
+                    sleep(_CONNECTION_POLL_S)
                 end
             catch e
-                if !(e isa InvalidStateException) && !ctx.shutdown_requested[]
-                    @warn "live session error" schema=ctx.schema exception=(e, catch_backtrace())
+                if !(e isa InvalidStateException) && !_any_shutdown(ctxs)
+                    @warn "live session error" schemas=schemas exception=(e, catch_backtrace())
                 end
             end
         catch e
-            if !(e isa InvalidStateException) && !ctx.shutdown_requested[]
-                @warn "live session error" schema=ctx.schema exception=(e, catch_backtrace())
+            if !(e isa InvalidStateException) && !_any_shutdown(ctxs)
+                @warn "live session error" schemas=schemas exception=(e, catch_backtrace())
             end
         finally
-            ctx.current_client = nothing
+            for ctx in values(ctxs); ctx.current_client = nothing; end
             try; close(client); catch; end
-            # Closing the client closes the control channel; wait for the
-            # drainer to drain in-flight records and exit cleanly.
+            # Closing the client closes every typed channel + the control
+            # channel; wait for drainers to flush in-flight records.
+            for t in values(consumer_tasks); try; wait(t); catch; end; end
             ctrl_drainer === nothing || (try; wait(ctrl_drainer); catch; end)
         end
 
-        ctx.shutdown_requested[]                         && return
-        ctx.stats.error !== nothing                      && return
+        _any_shutdown(ctxs)                              && return
+        _any_error(ctxs)                                 && return
         !reconnect                                       && return
         deadline !== nothing && time() >= deadline       && return
-        ctx.stats.reconnects += 1
-        @warn "live disconnect — reconnecting" schema=ctx.schema attempt=ctx.stats.reconnects
+        for ctx in values(ctxs); ctx.stats.reconnects += 1; end
+        @warn "live disconnect — reconnecting" schemas=schemas attempt=first(values(ctxs)).stats.reconnects
         sleep(_RECONNECT_WAIT_S)
     end
 end
@@ -510,13 +568,14 @@ function stream_to_file(; schema::Schema.T,
         rotate_seconds = path === nothing ? rotate_seconds : nothing,
     )
     ctx = SessionContext(schema, SessionStats(schema = schema), file)
+    ctxs = Dict{Schema.T,SessionContext}(schema => ctx)
 
     deadline = duration_s === nothing ? nothing : time() + Float64(duration_s)
     monitor_stop = Threads.Atomic{Bool}(false)
     monitor_task = @async _session_monitor(ctx, Float64(heartbeat_log_interval_s), monitor_stop)
 
     try
-        _run_session(ctx;
+        _run_unified_session(ctxs;
             dataset = dataset, stype_in = stype_in, symbols = symbols,
             reconnect = reconnect, deadline = deadline,
             key = key, gateway = gateway, port = port,
@@ -592,28 +651,28 @@ function stream_multi_to_files(; schemas::AbstractVector,
     deadline = duration_s === nothing ? nothing : time() + Float64(duration_s)
     monitor_stops = Dict(s => Threads.Atomic{Bool}(false) for s in keys(contexts))
     monitor_tasks = Dict{Schema.T,Task}()
-    worker_tasks  = Dict{Schema.T,Task}()
     for (sch, ctx) in contexts
         monitor_tasks[sch] = @async _session_monitor(ctx, Float64(heartbeat_log_interval_s),
                                                      monitor_stops[sch])
-        worker_tasks[sch]  = @async try
-            _run_session(ctx;
-                dataset = dataset, stype_in = stype_in, symbols = symbols,
-                reconnect = reconnect, deadline = deadline,
-                key = key, gateway = gateway, port = port,
-                wire_compression = wire_compression,
-                heartbeat_interval = heartbeat_interval,
-                slow_reader_behavior = slow_reader_behavior,
-                channel_size = channel_size,
-                start_initial = start, snapshot = snapshot,
-            )
-        catch e
-            @error "live worker crashed" schema=sch exception=(e, catch_backtrace())
-        end
+    end
+
+    session_task = @async try
+        _run_unified_session(contexts;
+            dataset = dataset, stype_in = stype_in, symbols = symbols,
+            reconnect = reconnect, deadline = deadline,
+            key = key, gateway = gateway, port = port,
+            wire_compression = wire_compression,
+            heartbeat_interval = heartbeat_interval,
+            slow_reader_behavior = slow_reader_behavior,
+            channel_size = channel_size,
+            start_initial = start, snapshot = snapshot,
+        )
+    catch e
+        @error "live session crashed" exception=(e, catch_backtrace())
     end
 
     try
-        while any(!istaskdone(t) for t in values(worker_tasks))
+        while !istaskdone(session_task)
             sleep(_CONNECTION_POLL_S)
             if deadline !== nothing && time() >= deadline
                 for ctx in values(contexts); ctx.shutdown_requested[] = true; end
@@ -622,7 +681,7 @@ function stream_multi_to_files(; schemas::AbstractVector,
         end
     catch e
         if e isa InterruptException
-            @warn "interrupt — stopping all live captures"
+            @warn "interrupt — stopping live capture"
             for ctx in values(contexts); _request_shutdown!(ctx); end
         else
             rethrow()
@@ -630,10 +689,8 @@ function stream_multi_to_files(; schemas::AbstractVector,
     end
 
     join_deadline = time() + _SHUTDOWN_JOIN_TIMEOUT_S
-    for t in values(worker_tasks)
-        while !istaskdone(t) && time() < join_deadline
-            sleep(0.1)
-        end
+    while !istaskdone(session_task) && time() < join_deadline
+        sleep(0.1)
     end
     for s in keys(monitor_stops); monitor_stops[s][] = true; end
     for t in values(monitor_tasks)
