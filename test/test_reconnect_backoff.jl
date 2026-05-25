@@ -92,6 +92,48 @@ end
     try; close(mock.server); catch; end
 end
 
+@testset "reconnect — duration_s cuts off mid-backoff sleep" begin
+    # Regression guard for Codex P1: with full-jitter backoff a single retry
+    # can sleep up to 60s. The reconnect loop must remain responsive to the
+    # deadline so `duration_s` is honored even if the deadline is crossed
+    # while a backoff sleep is in flight.
+    #
+    # We force the loop into the high-backoff regime by setting a small base
+    # and a large cap via the existing `_reconnect_delay` defaults, then check
+    # that the call returns close to `duration_s` regardless of how many
+    # attempts have stacked up.
+    accept_count = Threads.Atomic{Int}(0)
+    scripts = [function(sock)
+        Threads.atomic_add!(accept_count, 1)
+        return
+    end for _ in 1:50]
+    mock = spawn_mock_gateway_sequence(scripts)
+
+    duration = 1.5
+    t0 = time()
+    mktempdir() do dir
+        DatabentoAPI.stream_to_file(
+            schema = DBN.Schema.TRADES, symbols = ["AAPL"],
+            dataset = "TEST.MOCK", stype_in = DBN.SType.RAW_SYMBOL,
+            base_dir = dir, compress = false,
+            duration_s = duration,
+            reconnect = true,
+            max_reconnect_attempts = nothing,   # let cap-by-deadline drive exit
+            key = _BACKOFF_TEST_KEY,
+            gateway = "127.0.0.1", port = mock.port,
+            wire_compression = DBN.Compression.NONE,
+            heartbeat_log_interval_s = 5.0,
+        )
+    end
+    elapsed = time() - t0
+
+    # Should be roughly `duration_s` plus a small slack for the last in-flight
+    # sleep slice (≤ _CONNECTION_POLL_S = 0.5s) and handshake overhead. Without
+    # the fix, a single sleep of up to 60s could blow this out.
+    @test elapsed < duration + 3.0
+    try; close(mock.server); catch; end
+end
+
 @testset "reconnect — reconnect=false bypasses cap entirely" begin
     # When reconnect is disabled, the first accepted connection is the only one
     # regardless of max_reconnect_attempts. Verifies kwargs don't interact

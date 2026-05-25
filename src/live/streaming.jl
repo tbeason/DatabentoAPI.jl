@@ -48,6 +48,22 @@ function _reconnect_delay(attempt::Integer;
     return rand() * upper
 end
 
+# Sleep up to `delay` seconds, but wake every `_CONNECTION_POLL_S` to check for
+# shutdown / deadline so a long backoff window doesn't pin `duration_s` or
+# `shutdown_requested[]` responsiveness. Matches the cadence of the main
+# coordination loop.
+function _wait_for_reconnect(delay::Float64, ctxs, deadline::Union{Nothing,Float64})
+    delay > 0.0 || return
+    deadline_at = time() + delay
+    while true
+        _any_shutdown(ctxs)                          && return
+        deadline !== nothing && time() >= deadline   && return
+        remaining = deadline_at - time()
+        remaining > 0 || return
+        sleep(min(_CONNECTION_POLL_S, remaining))
+    end
+end
+
 const _SPARSE_SCHEMAS = (Schema.STATUS, Schema.DEFINITION, Schema.IMBALANCE)
 
 # StatusMsg.action codes that warrant a console alert per Databento's status
@@ -485,7 +501,7 @@ function _run_unified_session(ctxs::Dict{Schema.T,SessionContext};
         end
         delay = _reconnect_delay(attempt)
         @warn "live disconnect — reconnecting" schemas=schemas attempt=attempt delay_s=round(delay; digits=2)
-        sleep(delay)
+        _wait_for_reconnect(delay, ctxs, deadline)
     end
 end
 
