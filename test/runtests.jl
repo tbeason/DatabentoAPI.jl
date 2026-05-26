@@ -22,6 +22,7 @@ try
         include("test_live_reader_typed.jl")
         include("test_live_subscribe.jl")
         include("test_live_streaming.jl")
+        include("test_reconnect_backoff.jl")
         include("test_typed_mode_errors.jl")
     end
 catch e

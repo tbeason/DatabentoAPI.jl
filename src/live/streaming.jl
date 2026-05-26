@@ -18,8 +18,11 @@
 # Reconnect: on TCP drop, rebuild the Live and re-subscribe every schema with
 # its own `start =` the lowest per-instrument timestamp seen so far (ts_recv
 # for BBO families, ts_event otherwise), bounded to within Databento's 24h
-# replay window. `ErrorMsg` from the gateway is treated as terminal for all
-# schemas on this connection (no reconnect).
+# replay window. Between attempts we sleep `rand() * min(cap, base*2^(n-1))`
+# (AWS-style full-jitter exponential backoff, capped at 60s) and give up
+# after `max_reconnect_attempts` retries (default 10; pass `nothing` for
+# unlimited). `ErrorMsg` from the gateway is still terminal for all schemas
+# on this connection (no reconnect).
 #
 # Head-of-line caveat: the reader task `put!`s to each schema's typed channel
 # in turn. If consumer N's disk write falls behind enough to fill its
@@ -27,11 +30,39 @@
 # channel_size=10_000 is generally enough headroom; tune up for very bursty
 # schemas paired with a slow archive disk.
 
-const _RECONNECT_WAIT_S        = 1.0
+const _RECONNECT_BASE_S        = 1.0
+const _RECONNECT_CAP_S         = 60.0
 const _STALE_THRESHOLD_S       = 30.0
 const _SHUTDOWN_JOIN_TIMEOUT_S = 15.0
 const _CONNECTION_POLL_S       = 0.5
 const _REPLAY_WINDOW_NS        = Int64(24 * 3600) * 1_000_000_000
+
+# Full-jitter exponential backoff (AWS-recommended): wait drawn uniformly from
+# [0, min(cap, base * 2^(attempt-1))). `attempt` is 1-based — `attempt=1` is
+# the delay before the first reconnect.
+function _reconnect_delay(attempt::Integer;
+                          base::Real = _RECONNECT_BASE_S,
+                          cap::Real  = _RECONNECT_CAP_S)
+    attempt < 1 && return 0.0
+    upper = min(float(cap), float(base) * 2.0^(attempt - 1))
+    return rand() * upper
+end
+
+# Sleep up to `delay` seconds, but wake every `_CONNECTION_POLL_S` to check for
+# shutdown / deadline so a long backoff window doesn't pin `duration_s` or
+# `shutdown_requested[]` responsiveness. Matches the cadence of the main
+# coordination loop.
+function _wait_for_reconnect(delay::Float64, ctxs, deadline::Union{Nothing,Float64})
+    delay > 0.0 || return
+    deadline_at = time() + delay
+    while true
+        _any_shutdown(ctxs)                          && return
+        deadline !== nothing && time() >= deadline   && return
+        remaining = deadline_at - time()
+        remaining > 0 || return
+        sleep(min(_CONNECTION_POLL_S, remaining))
+    end
+end
 
 const _SPARSE_SCHEMAS = (Schema.STATUS, Schema.DEFINITION, Schema.IMBALANCE)
 
@@ -370,6 +401,7 @@ function _run_unified_session(ctxs::Dict{Schema.T,SessionContext};
                               stype_in::SType.T,
                               symbols,
                               reconnect::Bool,
+                              max_reconnect_attempts::Union{Integer,Nothing},
                               deadline::Union{Nothing,Float64},
                               key, gateway, port::Integer,
                               wire_compression::Compression.T,
@@ -462,8 +494,14 @@ function _run_unified_session(ctxs::Dict{Schema.T,SessionContext};
         !reconnect                                       && return
         deadline !== nothing && time() >= deadline       && return
         for ctx in values(ctxs); ctx.stats.reconnects += 1; end
-        @warn "live disconnect — reconnecting" schemas=schemas attempt=first(values(ctxs)).stats.reconnects
-        sleep(_RECONNECT_WAIT_S)
+        attempt = first(values(ctxs)).stats.reconnects
+        if max_reconnect_attempts !== nothing && attempt > max_reconnect_attempts
+            @warn "live reconnect attempts exhausted — giving up" schemas=schemas attempts=attempt limit=max_reconnect_attempts
+            return
+        end
+        delay = _reconnect_delay(attempt)
+        @warn "live disconnect — reconnecting" schemas=schemas attempt=attempt delay_s=round(delay; digits=2)
+        _wait_for_reconnect(delay, ctxs, deadline)
     end
 end
 
@@ -538,6 +576,11 @@ Returns the path to the most recently opened output file.
 The default `compress_level = 1` favours throughput; bench measurements show
 L1 is ~35% faster on the write boundary than L3 in exchange for ~15% larger
 files (see `benchmark/PERF_REPORT.md`). Pass a higher level for archival.
+
+`reconnect = true` (default) re-establishes the TCP session after a drop using
+full-jitter exponential backoff (1s base, 60s cap). After
+`max_reconnect_attempts` retries (default 10) the loop gives up and returns;
+pass `nothing` for unlimited.
 """
 function stream_to_file(; schema::Schema.T,
                         symbols,
@@ -550,6 +593,7 @@ function stream_to_file(; schema::Schema.T,
                         compress_level::Integer = 1,
                         rotate_seconds::Union{Nothing,Real} = nothing,
                         reconnect::Bool = true,
+                        max_reconnect_attempts::Union{Integer,Nothing} = 10,
                         key = nothing,
                         gateway = nothing,
                         port::Integer = DEFAULT_LIVE_PORT,
@@ -577,7 +621,9 @@ function stream_to_file(; schema::Schema.T,
     try
         _run_unified_session(ctxs;
             dataset = dataset, stype_in = stype_in, symbols = symbols,
-            reconnect = reconnect, deadline = deadline,
+            reconnect = reconnect,
+            max_reconnect_attempts = max_reconnect_attempts,
+            deadline = deadline,
             key = key, gateway = gateway, port = port,
             wire_compression = wire_compression,
             heartbeat_interval = heartbeat_interval,
@@ -600,6 +646,10 @@ Capture N Live schemas concurrently, one rotating-DBN file per schema. Returns
 a dict mapping each schema to its most recently opened output path. Press
 `Ctrl-C` to stop early; honours `duration_s` if provided.
 
+`reconnect`/`max_reconnect_attempts` work as in [`stream_to_file`](@ref):
+full-jitter exponential backoff between retries (1s base, 60s cap), default
+cap of 10 attempts, pass `nothing` for unlimited.
+
 Example:
 ```julia
 paths = stream_multi_to_files(
@@ -621,6 +671,7 @@ function stream_multi_to_files(; schemas::AbstractVector,
                                compress_level::Integer = 1,
                                rotate_seconds::Union{Nothing,Real} = nothing,
                                reconnect::Bool = true,
+                               max_reconnect_attempts::Union{Integer,Nothing} = 10,
                                key = nothing,
                                gateway = nothing,
                                port::Integer = DEFAULT_LIVE_PORT,
@@ -659,7 +710,9 @@ function stream_multi_to_files(; schemas::AbstractVector,
     session_task = @async try
         _run_unified_session(contexts;
             dataset = dataset, stype_in = stype_in, symbols = symbols,
-            reconnect = reconnect, deadline = deadline,
+            reconnect = reconnect,
+            max_reconnect_attempts = max_reconnect_attempts,
+            deadline = deadline,
             key = key, gateway = gateway, port = port,
             wire_compression = wire_compression,
             heartbeat_interval = heartbeat_interval,
