@@ -29,6 +29,35 @@ function _via_temp_dbn(s::DBNStore, out_path::AbstractString, fn)
     end
 end
 
+"""
+    to_csv(store, path)
+
+Write the records in `store` to a CSV file at `path`. Round-trips the records
+through a temporary DBN file because DBN.jl's CSV converter operates on file
+paths; for large stores prefer running `DBN.dbn_to_csv` directly on a captured
+`.dbn[.zst]` file from [`stream_to_file`](@ref).
+
+```julia
+store = get_range(client; dataset = "XNAS.ITCH", schema = Schema.TRADES,
+                  symbols = ["AAPL"], start = DateTime(2024,1,2,14,30),
+                  end_   = DateTime(2024,1,2,14,31), stype_in = SType.RAW_SYMBOL)
+to_csv(store, "trades.csv")
+```
+"""
 to_csv(s::DBNStore, path::AbstractString)     = _via_temp_dbn(s, path, DBN.dbn_to_csv)
+
+"""
+    to_json(store, path)
+
+Write the records in `store` to a newline-delimited JSON file at `path`. One
+record per line; same temp-DBN bounce as [`to_csv`](@ref).
+"""
 to_json(s::DBNStore, path::AbstractString)    = _via_temp_dbn(s, path, DBN.dbn_to_json)
+
+"""
+    to_parquet(store, path)
+
+Write the records in `store` to a Parquet file at `path`. Same temp-DBN bounce
+as [`to_csv`](@ref); the column schema comes from DBN.jl's `dbn_to_parquet`.
+"""
 to_parquet(s::DBNStore, path::AbstractString) = _via_temp_dbn(s, path, DBN.dbn_to_parquet)

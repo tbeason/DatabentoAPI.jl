@@ -1,5 +1,30 @@
 # Batch endpoints — submit asynchronous jobs and download results.
 
+"""
+    submit_job(client; dataset, symbols, schema, start, end_=nothing, ...) -> Dict
+
+Submit an asynchronous batch job. The Historical API queues the request and
+returns a `job_id`; poll [`list_jobs`](@ref) until the [`JobState`](@ref) is
+`DONE`, then call [`list_files`](@ref) and [`batch_download`](@ref) to fetch
+the results.
+
+Useful when the synchronous [`get_range`](@ref) would be too large to stream
+back in one HTTP response. Cost is the same as the equivalent `get_range`
+query; preview it with [`get_cost`](@ref) before submitting.
+
+Optional kwargs control output framing:
+
+  - `encoding`     — `"dbn"` (default), `"csv"`, `"json"`.
+  - `compression`  — `"zstd"` (default), `"none"`, `"zip"`.
+  - `stype_out`    — output symbology (default `SType.INSTRUMENT_ID`).
+  - `split_duration`/`split_size`/`split_symbols` — slice the output across
+    multiple files; see [`SplitDuration`](@ref).
+  - `packaging`    — bundle files for download; see [`Packaging`](@ref).
+  - `delivery`     — destination; see [`Delivery`](@ref).
+  - `limit`        — cap on records returned.
+
+Wraps `POST /v0/batch.submit_job`.
+"""
 function submit_job(c::Historical;
                     dataset::AbstractString,
                     symbols,
@@ -48,6 +73,16 @@ function submit_job(c::Historical;
     return post_json(c.http, hist_path("batch.submit_job"); body = body_pairs)
 end
 
+"""
+    list_jobs(client; states=nothing, since=nothing)
+
+List batch jobs submitted under the calling API key, optionally filtered
+to one or more [`JobState`](@ref) values (`states` accepts a single state,
+a vector, or a comma-separated string) and/or to jobs created after `since`
+(`DateTime`, ISO-8601 string, or unix-ns integer). Returns a JSON array of
+job objects.
+Wraps `GET /v0/batch.list_jobs`.
+"""
 function list_jobs(c::Historical;
                    states::Union{Nothing,AbstractVector,JobState.T,AbstractString} = nothing,
                    since::Union{Nothing,DateTime,AbstractString,Integer} = nothing)
@@ -64,6 +99,15 @@ function list_jobs(c::Historical;
                     query = (states = states_v, since = ts_str(since)))
 end
 
+"""
+    list_files(client; job_id)
+
+List the output files for a batch job identified by `job_id`. Each entry
+includes `filename`, `size`, `hash` (sha256), and a `urls.https` download
+URL. Used internally by [`batch_download`](@ref) but exposed for callers
+that need to inspect or selectively fetch files.
+Wraps `GET /v0/batch.list_files`.
+"""
 list_files(c::Historical; job_id::AbstractString) =
     get_json(c.http, hist_path("batch.list_files"); query = (; job_id = String(job_id)))
 
