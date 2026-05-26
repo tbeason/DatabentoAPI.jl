@@ -99,31 +99,71 @@ resolve, foreach_record
 
 ## Live example
 
+The do-block form mirrors `Base.open` and guarantees `close(client)` runs on
+`Ctrl-C`, exceptions, or normal exit — no `try/finally` boilerplate needed.
+
 ```julia
 using DatabentoAPI
 
-client = Live(dataset = "OPRA.PILLAR")
-connect!(client)
-subscribe!(client;
-    schema   = Schema.TRADES,
-    symbols  = ["AAPL"],
-    stype_in = SType.RAW_SYMBOL)
-start!(client)
+Live(dataset = "OPRA.PILLAR") do client
+    connect!(client)
+    subscribe!(client;
+        schema   = Schema.TRADES,
+        symbols  = ["AAPL"],
+        stype_in = SType.RAW_SYMBOL)
+    start!(client)
+    for rec in client                     # iterator pulls from internal Channel
+        println(rec)
+        rec isa DBN.TradeMsg && rec.price > some_threshold && break
+    end
+end   # Ctrl-C here triggers a clean close(client)
+```
 
-for rec in client                         # iterator pulls from internal Channel
-    println(rec)
-    rec isa DBN.TradeMsg && rec.price > some_threshold && break
-end
+Manual lifecycle still works if you prefer:
+
+```julia
+client = Live(dataset = "OPRA.PILLAR")
+connect!(client); subscribe!(client; …); start!(client)
+for rec in client; …; end
 close(client)
 ```
 
 Callback variant:
 
 ```julia
-subscribe_callback(client, rec -> @info "tick" rec)
-sleep(30)
-close(client)
+Live(dataset = "OPRA.PILLAR") do client
+    connect!(client)
+    subscribe!(client; schema = Schema.TRADES, symbols = ["AAPL"], stype_in = SType.RAW_SYMBOL)
+    subscribe_callback(client, rec -> @info "tick" rec)
+    start!(client)
+    sleep(30)
+end
 ```
+
+### Writing records to disk yourself
+
+If you want to subscribe and write records to a DBN file from your own loop —
+including in-file zstd frame rotation for crash safety — pair `Live` with
+`open_dbn_writer`:
+
+```julia
+Live(dataset = "GLBX.MDP3") do client
+    connect!(client)
+    subscribe!(client; schema = Schema.TRADES, symbols = ["ES.FUT"], stype_in = SType.PARENT)
+    start!(client)
+    open_dbn_writer(; base_dir = "./capture", dataset = "GLBX.MDP3",
+                      schema = Schema.TRADES, symbols = ["ES.FUT"],
+                      stype_in = SType.PARENT,
+                      frame_seconds = 60.0) do writer
+        for rec in client
+            write_record!(writer, rec)
+        end
+    end
+end
+```
+
+For the common case of "subscribe and dump every record to disk", use
+[`stream_to_file`](@ref) directly — it wraps the same pieces.
 
 ### Typed-channel variant (`typed = true`)
 
