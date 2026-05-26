@@ -1,6 +1,6 @@
 name = "DatabentoAPI"
 uuid = "feb0aed8-3291-460b-9688-521dcb17a4bf"
-version = "0.1.2"
+version = "0.1.1"
 authors = ["Tyler Beason <tbeas12@gmail.com>"]
 
 [deps]
