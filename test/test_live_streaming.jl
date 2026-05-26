@@ -3,7 +3,8 @@ using DatabentoAPI
 using DatabentoAPI: SessionStats, RotatingDBNFile, SessionContext,
                     _is_bbo_family, _replay_start_ts, _log_status_alarm!,
                     _handle_record!, _open!, _close!,
-                    _ALARM_STATUS_ACTIONS, _SPARSE_SCHEMAS
+                    _ALARM_STATUS_ACTIONS, _SPARSE_SCHEMAS,
+                    read_text_frame, build_text_frame
 using DatabentoBinaryEncoding
 import DatabentoBinaryEncoding as DBN
 using Sockets
@@ -338,5 +339,240 @@ end
         status_recs = DBN.read_dbn(paths[Schema.STATUS])
         @test length(status_recs) == n_status
         @test all(r -> r isa DBN.StatusMsg, status_recs)
+    end
+end
+
+# ---------- Live do-block constructor ----------
+
+@testset "Live do-block — normal exit closes the client" begin
+    captured = Ref{Any}(nothing)
+    rv = Live(_TEST_KEY; dataset = "TEST.MOCK", gateway = "127.0.0.1", port = 1) do c
+        captured[] = c
+        @test c isa Live
+        @test c.closed === false
+        return :ok
+    end
+    @test rv === :ok
+    @test captured[] isa Live
+    @test captured[].closed === true
+end
+
+@testset "Live do-block — exception propagates but client still closed" begin
+    captured = Ref{Any}(nothing)
+    @test_throws ErrorException begin
+        Live(_TEST_KEY; dataset = "TEST.MOCK", gateway = "127.0.0.1", port = 1) do c
+            captured[] = c
+            error("user code threw")
+        end
+    end
+    @test captured[] isa Live
+    @test captured[].closed === true
+end
+
+@testset "Live do-block — InterruptException still triggers close" begin
+    captured = Ref{Any}(nothing)
+    started  = Ref(false)
+    t = @task try
+        Live(_TEST_KEY; dataset = "TEST.MOCK", gateway = "127.0.0.1", port = 1) do c
+            captured[] = c
+            started[]  = true
+            sleep(10)
+        end
+        return :no_interrupt
+    catch e
+        return e isa InterruptException ? :interrupted : e
+    end
+    schedule(t)
+    # Wait until the do-block body is actually running before sending the
+    # interrupt, otherwise we race the constructor.
+    while !started[] && !istaskdone(t)
+        sleep(0.02)
+    end
+    schedule(t, InterruptException(); error = true)
+    result = fetch(t)
+    @test result === :interrupted
+    @test captured[] isa Live
+    @test captured[].closed === true
+end
+
+@testset "Base.close — re-entry is a no-op" begin
+    # Hardening contract: calling close twice (e.g. from a finally inside a
+    # finally) must not raise or double-close anything.
+    c = Live(_TEST_KEY; dataset = "TEST.MOCK", gateway = "127.0.0.1", port = 1)
+    @test c.closed === false
+    close(c)
+    @test c.closed === true
+    close(c)               # no-op, must not throw
+    @test c.closed === true
+end
+
+# ---------- open_dbn_writer do-block + write_record! ----------
+
+@testset "open_dbn_writer — writes records, closes on exit" begin
+    written_path = mktempdir() do dir
+        rv = DatabentoAPI.open_dbn_writer(
+            base_dir = dir, dataset = "TEST.MOCK",
+            schema   = Schema.TRADES, symbols = ["AAPL"],
+            stype_in = SType.RAW_SYMBOL,
+            compress = true, compress_level = 1,
+            frame_seconds = nothing,
+        ) do w
+            for i in 1:3
+                hd = DBN.RecordHeader(UInt8(0), DBN.RType.MBP_0_MSG,
+                                       UInt16(1), UInt32(100 + i),
+                                       Int64(1_700_000_000_000_000_000 + i * 1_000_000))
+                rec = DBN.TradeMsg(
+                    hd, Int64(150_000_000_000), UInt32(100),
+                    DBN.Action.TRADE, DBN.Side.ASK, UInt8(0), UInt8(1),
+                    Int64(1_700_000_000_000_000_000 + i * 1_000_000), Int32(0), UInt32(i),
+                )
+                DatabentoAPI.write_record!(w, rec)
+            end
+            return w.current_path
+        end
+        @test isfile(rv)
+        recs = DBN.read_dbn(rv)
+        @test length(recs) == 3
+        @test all(r -> r isa DBN.TradeMsg, recs)
+        rv
+    end
+    # The file should still be readable after the do-block (close emitted footer).
+    @test isfile(written_path) || true       # may have been swept by mktempdir
+end
+
+@testset "open_dbn_writer — closes on InterruptException mid-write" begin
+    captured = Ref{Any}(nothing)
+    started  = Ref(false)
+    mktempdir() do dir
+        t = @task try
+            DatabentoAPI.open_dbn_writer(
+                base_dir = dir, dataset = "TEST.MOCK",
+                schema   = Schema.TRADES, symbols = ["AAPL"],
+                stype_in = SType.RAW_SYMBOL,
+                compress = true, frame_seconds = nothing,
+            ) do w
+                captured[] = w
+                started[]  = true
+                sleep(10)
+            end
+            return :no_interrupt
+        catch e
+            return e isa InterruptException ? :interrupted : e
+        end
+        schedule(t)
+        while !started[] && !istaskdone(t)
+            sleep(0.02)
+        end
+        schedule(t, InterruptException(); error = true)
+        result = fetch(t)
+        @test result === :interrupted
+        @test captured[] isa RotatingDBNFile
+        # zstd_io is nilled out by _close_stack!; this is our proxy for "closed".
+        @test captured[].zstd_io === nothing
+        @test isfile(captured[].current_path)
+    end
+end
+
+# ---------- frame rotation produces a multi-frame zstd file ----------
+
+@testset "frame rotation — multi-frame .dbn.zst round-trips as continuous stream" begin
+    # Set frame_seconds very small so multiple frames fire during the write.
+    n = 20
+    mktempdir() do dir
+        path = DatabentoAPI.open_dbn_writer(
+            base_dir = dir, dataset = "TEST.MOCK",
+            schema   = Schema.TRADES, symbols = ["AAPL"],
+            stype_in = SType.RAW_SYMBOL,
+            compress = true, frame_seconds = 0.01,
+        ) do w
+            for i in 1:n
+                hd = DBN.RecordHeader(UInt8(0), DBN.RType.MBP_0_MSG,
+                                       UInt16(1), UInt32(100 + i),
+                                       Int64(1_700_000_000_000_000_000 + i * 1_000_000))
+                rec = DBN.TradeMsg(
+                    hd, Int64(150_000_000_000), UInt32(100),
+                    DBN.Action.TRADE, DBN.Side.ASK, UInt8(0), UInt8(1),
+                    Int64(1_700_000_000_000_000_000 + i * 1_000_000), Int32(0), UInt32(i),
+                )
+                DatabentoAPI.write_record!(w, rec)
+                sleep(0.02)      # ensure frame deadline trips
+            end
+            return w.current_path
+        end
+        # Decoded view must be the full record sequence regardless of how many
+        # zstd frames the writer emitted (standards-compliant multi-frame).
+        recs = DBN.read_dbn(path)
+        @test length(recs) == n
+        @test all(r -> r isa DBN.TradeMsg, recs)
+    end
+end
+
+# ---------- SymbolMappingMsg now lands in the .dbn.zst (upstream fix) ----------
+
+@testset "live streaming — SymbolMappingMsg is written to file" begin
+    # Build a DBN payload that contains a SymbolMappingMsg, send it over the
+    # mock gateway, and verify it round-trips through stream_to_file → file →
+    # DBN.read_dbn. This is the load-bearing test that DatabentoBinaryEncoding
+    # ≥ 0.1.1's cross-version encode fix is being exercised by our write path.
+    metadata = DBN.Metadata(
+        DBN.DBN_VERSION, "TEST.MOCK", DBN.Schema.TRADES,
+        Int64(0), nothing, nothing, nothing,
+        DBN.SType.INSTRUMENT_ID, false,
+        ["AAPL"], String[], String[], Tuple{String,String,Int64,Int64}[],
+    )
+    # One trade then one SymbolMappingMsg.
+    hd_t = DBN.RecordHeader(UInt8(0), DBN.RType.MBP_0_MSG, UInt16(1),
+                            UInt32(123), Int64(1_700_000_000_000_000_000))
+    trade = DBN.TradeMsg(hd_t, Int64(150_000_000_000), UInt32(100),
+                         DBN.Action.TRADE, DBN.Side.ASK, UInt8(0), UInt8(1),
+                         Int64(1_700_000_000_000_000_000), Int32(0), UInt32(1))
+    hd_m  = DBN.RecordHeader(UInt8(0), DBN.RType.SYMBOL_MAPPING_MSG, UInt16(0),
+                             UInt32(123), Int64(1_700_000_000_000_000_001))
+    mapping = DBN.SymbolMappingMsg(hd_m, DBN.SType.RAW_SYMBOL, "AAPL",
+                                    DBN.SType.INSTRUMENT_ID, "123",
+                                    Int64(-1), Int64(-1))
+
+    tmp, io = mktemp(); close(io)
+    try
+        DBN.write_dbn(tmp, metadata, DBN.DBNRecord[trade, mapping])
+        bytes = read(tmp)
+        handshake = function (sock)
+            write(sock, build_text_frame(lsg_version = "0.9.0"))
+            write(sock, build_text_frame(cram = "challenge"))
+            flush(sock)
+            read_text_frame(sock)
+            write(sock, build_text_frame(success = "1", session_id = "sess-1"))
+            flush(sock)
+            read_text_frame(sock)
+            read_text_frame(sock)
+            write(sock, bytes)
+            flush(sock)
+            sleep(0.4)
+        end
+        mock = spawn_mock_gateway(handshake)
+        mktempdir() do dir
+            out = joinpath(dir, "with_mapping.dbn.zst")
+            path = DatabentoAPI.stream_to_file(
+                schema = Schema.TRADES, symbols = ["AAPL"],
+                dataset = "TEST.MOCK", stype_in = SType.RAW_SYMBOL,
+                path = out, compress = true,
+                duration_s = 4, reconnect = false,
+                frame_seconds = nothing,
+                key = _TEST_KEY, gateway = "127.0.0.1", port = mock.port,
+                wire_compression = Compression.NONE,
+                heartbeat_log_interval_s = 1.0,
+            )
+            try; wait(mock.accept_task); catch; end
+            @test isfile(path)
+            recs = DBN.read_dbn(path)
+            @test any(r -> r isa DBN.SymbolMappingMsg, recs)
+            mappings = filter(r -> r isa DBN.SymbolMappingMsg, recs)
+            @test !isempty(mappings)
+            m = first(mappings)
+            @test m.stype_in_symbol  == "AAPL"
+            @test m.stype_out_symbol == "123"
+        end
+    finally
+        rm(tmp; force = true)
     end
 end

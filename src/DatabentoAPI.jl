@@ -109,5 +109,6 @@ export channel, control_channel
 
 # Live capture to file
 export stream_to_file, stream_multi_to_files, default_live_path, read_capture
+export open_dbn_writer, write_record!
 
 end # module DatabentoAPI

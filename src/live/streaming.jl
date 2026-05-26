@@ -107,6 +107,14 @@ mutable struct RotatingDBNFile
     rotations::Int
     all_paths::Vector{String}
     write_lock::ReentrantLock
+    # In-file zstd frame rotation for crash safety. Every `frame_seconds`,
+    # close the current zstd frame (writes footer to raw_io) and start a new
+    # one on the same file. Multi-frame .dbn.zst is standards-compliant to
+    # any zstd reader, so a hard kill loses ≤ one frame of records rather
+    # than corrupting the whole file. `nothing` disables it (single frame).
+    frame_seconds::Union{Nothing,Float64}
+    frame_opened_at::Float64
+    frame_count::Int
 end
 
 function RotatingDBNFile(; base_dir::AbstractString,
@@ -117,7 +125,8 @@ function RotatingDBNFile(; base_dir::AbstractString,
                           stype_in::SType.T,
                           compress::Bool,
                           compress_level::Integer,
-                          rotate_seconds::Union{Nothing,Real})
+                          rotate_seconds::Union{Nothing,Real},
+                          frame_seconds::Union{Nothing,Real} = nothing)
     syms_vec = symbols isa AbstractString ? [String(symbols)] : String.(symbols)
     f = RotatingDBNFile(
         String(base_dir),
@@ -126,6 +135,8 @@ function RotatingDBNFile(; base_dir::AbstractString,
         compress, Int(compress_level),
         rotate_seconds === nothing ? nothing : Float64(rotate_seconds),
         nothing, nothing, nothing, "", 0.0, 0, String[], ReentrantLock(),
+        frame_seconds === nothing ? nothing : Float64(frame_seconds),
+        0.0, 0,
     )
     _open!(f)
     return f
@@ -161,13 +172,44 @@ function _open!(f::RotatingDBNFile)
     )
     enc = DBN.DBNEncoder(top, md)
     DBN.write_header(enc)
-    f.raw_io       = raw
-    f.zstd_io      = top
-    f.encoder      = enc
-    f.current_path = path
-    f.opened_at    = time()
+    f.raw_io          = raw
+    f.zstd_io         = top
+    f.encoder         = enc
+    f.current_path    = path
+    f.opened_at       = time()
+    f.frame_opened_at = time()  # first frame opens with the file
     push!(f.all_paths, path)
     return nothing
+end
+
+# In-file zstd frame rotation. Writes TranscodingStreams' TOKEN_END through
+# the active zstd stream + flushes, which makes the codec emit the zstd
+# frame footer to raw_io. Subsequent writes start a fresh frame on the same
+# stream — the resulting .dbn.zst is a multi-frame zstd file, fully
+# standards-compliant. DBN-level layout is unaffected: the metadata header
+# was written once at file open, and the decompressed output is concatenated
+# across frames, so readers see "header then records".
+#
+# Crucially this does NOT close the underlying TranscodingStream (which
+# would also close raw_io), and does NOT recreate the DBN encoder — same
+# instance keeps working across the frame boundary.
+function _rotate_frame_if_needed!(f::RotatingDBNFile)
+    f.frame_seconds === nothing && return false
+    f.compress                  || return false   # only meaningful for compressed files
+    return lock(f.write_lock) do
+        (time() - f.frame_opened_at) < f.frame_seconds && return false
+        f.zstd_io === nothing && return false   # file closed concurrently
+        try
+            write(f.zstd_io, TranscodingStreams.TOKEN_END)
+            flush(f.zstd_io)
+        catch e
+            @warn "frame rotation: writing frame footer raised" schema=f.schema exception=e
+            return false
+        end
+        f.frame_opened_at = time()
+        f.frame_count    += 1
+        return true
+    end
 end
 
 function _close_stack!(f::RotatingDBNFile)
@@ -206,7 +248,9 @@ end
 
 function _write_record!(f::RotatingDBNFile, rec)
     lock(f.write_lock) do
-        _rotate_if_needed!(f)
+        # File rotation (new .dbn.zst) takes precedence over frame rotation:
+        # if we just opened a fresh file, its zstd frame is brand new anyway.
+        _rotate_if_needed!(f) || _rotate_frame_if_needed!(f)
         DBN.write_record(f.encoder, rec)
     end
     return nothing
@@ -221,6 +265,86 @@ function _flush!(f::RotatingDBNFile)
 end
 
 _close!(f::RotatingDBNFile) = lock(() -> _close_stack!(f), f.write_lock)
+
+# ---------- public DBN writer wrapper ----------
+
+"""
+    open_dbn_writer(f::Function;
+                    base_dir, dataset, schema, symbols, stype_in,
+                    compress = true, compress_level = 1,
+                    rotate_seconds = nothing,
+                    frame_seconds = 60.0,
+                    explicit_path = nothing)
+
+Open a DBN file writer, run `f(writer)`, and guarantee the file is flushed
+and closed in `finally` — so on `InterruptException` (Ctrl-C), an exception,
+or normal exit the zstd frame footer is emitted and `current_path` is a
+well-formed `.dbn.zst`.
+
+Use this when iterating records from a `Live` client (or any other source)
+and writing them to a Databento Binary Encoding file with the same
+durability features `stream_to_file` uses internally:
+
+  - Optional **time-based file rotation** via `rotate_seconds` (close the
+    current file, open the next one with a fresh timestamp).
+  - **In-file zstd frame rotation** via `frame_seconds` (default 60s) for
+    crash safety. A hard kill loses at most one frame of records instead
+    of corrupting the whole file. Pass `nothing` to disable.
+
+Inside the do-block, call [`write_record!`](@ref)`(writer, rec)` for each
+record. The writer also exposes `writer.current_path` if you need it.
+
+```julia
+Live(dataset = "GLBX.MDP3") do client
+    connect!(client)
+    subscribe!(client; schema = Schema.TRADES, symbols = ["ES.FUT"], stype_in = SType.PARENT)
+    start!(client)
+    open_dbn_writer(; base_dir = "./capture", dataset = "GLBX.MDP3",
+                      schema = Schema.TRADES, symbols = ["ES.FUT"],
+                      stype_in = SType.PARENT) do writer
+        for rec in client
+            write_record!(writer, rec)
+        end
+    end
+end
+```
+
+Returns whatever `f(writer)` returns.
+"""
+function open_dbn_writer(f::Function;
+                         base_dir::AbstractString,
+                         dataset::AbstractString,
+                         schema::Schema.T,
+                         symbols,
+                         stype_in::SType.T,
+                         compress::Bool = true,
+                         compress_level::Integer = 1,
+                         rotate_seconds::Union{Nothing,Real} = nothing,
+                         frame_seconds::Union{Nothing,Real} = 60.0,
+                         explicit_path::Union{Nothing,AbstractString} = nothing)
+    writer = RotatingDBNFile(
+        base_dir = base_dir, explicit_path = explicit_path,
+        dataset = dataset, schema = schema, symbols = symbols, stype_in = stype_in,
+        compress = compress, compress_level = compress_level,
+        rotate_seconds = explicit_path === nothing ? rotate_seconds : nothing,
+        frame_seconds = frame_seconds,
+    )
+    try
+        return f(writer)
+    finally
+        _close!(writer)
+    end
+end
+
+"""
+    write_record!(writer, rec)
+
+Write one DBN record to a writer opened via [`open_dbn_writer`](@ref).
+Thread-safe: holds the writer's internal lock for the duration of the
+write so concurrent calls (e.g. from per-schema consumer tasks) cannot
+interleave bytes.
+"""
+write_record!(w::RotatingDBNFile, rec) = _write_record!(w, rec)
 
 # ---------- session context ----------
 
@@ -302,18 +426,17 @@ function _handle_data!(ctx::SessionContext, rec)
 end
 
 # Control-record path: SymbolMappingMsg / SystemMsg / ErrorMsg.
-# Counts + special handling per type. Never written to disk (mappings
-# break round-trip due to v1/v3 layout drift; system/error are noise).
+# Counts + special handling per type. SymbolMappingMsg is written to the
+# DBN file alongside data records — DatabentoBinaryEncoding ≥ 0.1.1 fixes
+# the v1→v3 layout re-encoding so the on-disk record has a consistent
+# header length and round-trips through DBN.read_dbn_with_metadata. System
+# and Error messages are not written to disk (they're heartbeat / control
+# noise that doesn't belong in a record stream).
 function _handle_control!(ctx::SessionContext, rec)
     s = ctx.stats
     if rec isa DBN.SymbolMappingMsg
-        # Don't write SymbolMappingMsg to disk: live gateway sends v1-layout
-        # records (80 bytes) but our file metadata is v3, so DBN.jl's encoder
-        # would write them as v3 (~180 bytes) with the original hd.length=20,
-        # desyncing the file. Schema-pure files are the simplest fix; if the
-        # caller needs instrument_id → raw_symbol resolution, use the
-        # `symbology.resolve` historical endpoint with the same symbols.
         s.mapping_count += 1
+        _write_record!(ctx.file, rec)
     elseif rec isa DBN.SystemMsg
         s.system_count += 1
         is_heartbeat(rec) || @debug "SystemMsg" schema=ctx.schema msg=rec.msg
@@ -532,6 +655,14 @@ function _session_monitor(ctx::SessionContext, interval_s::Float64,
         if isopen(ctx.flush_request) && !isready(ctx.flush_request)
             try; put!(ctx.flush_request, nothing); catch; end
         end
+        # Directly flush + rotate frame from the monitor task. This is the
+        # only mechanism that fires for QUIET schemas — _write_record! only
+        # runs when records arrive, and the main coordination loop blocks
+        # on a per-schema channel that's empty. Without this, a quiet
+        # schema's in-memory zstd buffer (including the DBN metadata
+        # header) never reaches disk and a hard kill loses the entire file.
+        try; _flush!(ctx.file); catch; end
+        try; _rotate_frame_if_needed!(ctx.file); catch; end
         last_count = cur
         last_tick  = now
     end
@@ -581,6 +712,15 @@ files (see `benchmark/PERF_REPORT.md`). Pass a higher level for archival.
 full-jitter exponential backoff (1s base, 60s cap). After
 `max_reconnect_attempts` retries (default 10) the loop gives up and returns;
 pass `nothing` for unlimited.
+
+`frame_seconds = 60.0` (default) closes the active zstd frame and starts a new
+one every minute, so a hard kill (SIGKILL, OOM, power loss) loses at most one
+frame of records instead of corrupting the whole file. Pass `nothing` to write
+a single frame. The output is a standards-compliant multi-frame `.dbn.zst` and
+reads back as one continuous record stream via any zstd reader.
+
+Press `Ctrl-C` for a clean shutdown — the active zstd frame footer is flushed
+before the function returns.
 """
 function stream_to_file(; schema::Schema.T,
                         symbols,
@@ -592,6 +732,7 @@ function stream_to_file(; schema::Schema.T,
                         compress::Bool = true,
                         compress_level::Integer = 1,
                         rotate_seconds::Union{Nothing,Real} = nothing,
+                        frame_seconds::Union{Nothing,Real} = 60.0,
                         reconnect::Bool = true,
                         max_reconnect_attempts::Union{Integer,Nothing} = 10,
                         key = nothing,
@@ -605,38 +746,38 @@ function stream_to_file(; schema::Schema.T,
                         start = nothing,
                         snapshot::Bool = false)::String
     base = base_dir === nothing ? joinpath(pwd(), "live") : String(base_dir)
-    file = RotatingDBNFile(
+    return open_dbn_writer(
         base_dir = base, explicit_path = path,
         dataset = dataset, schema = schema, symbols = symbols, stype_in = stype_in,
         compress = compress, compress_level = compress_level,
-        rotate_seconds = path === nothing ? rotate_seconds : nothing,
-    )
-    ctx = SessionContext(schema, SessionStats(schema = schema), file)
-    ctxs = Dict{Schema.T,SessionContext}(schema => ctx)
+        rotate_seconds = rotate_seconds, frame_seconds = frame_seconds,
+    ) do file
+        ctx = SessionContext(schema, SessionStats(schema = schema), file)
+        ctxs = Dict{Schema.T,SessionContext}(schema => ctx)
 
-    deadline = duration_s === nothing ? nothing : time() + Float64(duration_s)
-    monitor_stop = Threads.Atomic{Bool}(false)
-    monitor_task = @async _session_monitor(ctx, Float64(heartbeat_log_interval_s), monitor_stop)
+        deadline = duration_s === nothing ? nothing : time() + Float64(duration_s)
+        monitor_stop = Threads.Atomic{Bool}(false)
+        monitor_task = @async _session_monitor(ctx, Float64(heartbeat_log_interval_s), monitor_stop)
 
-    try
-        _run_unified_session(ctxs;
-            dataset = dataset, stype_in = stype_in, symbols = symbols,
-            reconnect = reconnect,
-            max_reconnect_attempts = max_reconnect_attempts,
-            deadline = deadline,
-            key = key, gateway = gateway, port = port,
-            wire_compression = wire_compression,
-            heartbeat_interval = heartbeat_interval,
-            slow_reader_behavior = slow_reader_behavior,
-            channel_size = channel_size,
-            start_initial = start, snapshot = snapshot,
-        )
-    finally
-        monitor_stop[] = true
-        try; istaskdone(monitor_task) || sleep(0.1); catch; end
-        _close!(file)
+        try
+            _run_unified_session(ctxs;
+                dataset = dataset, stype_in = stype_in, symbols = symbols,
+                reconnect = reconnect,
+                max_reconnect_attempts = max_reconnect_attempts,
+                deadline = deadline,
+                key = key, gateway = gateway, port = port,
+                wire_compression = wire_compression,
+                heartbeat_interval = heartbeat_interval,
+                slow_reader_behavior = slow_reader_behavior,
+                channel_size = channel_size,
+                start_initial = start, snapshot = snapshot,
+            )
+        finally
+            monitor_stop[] = true
+            try; istaskdone(monitor_task) || sleep(0.1); catch; end
+        end
+        return ctx.file.current_path
     end
-    return ctx.file.current_path
 end
 
 """
@@ -649,6 +790,10 @@ a dict mapping each schema to its most recently opened output path. Press
 `reconnect`/`max_reconnect_attempts` work as in [`stream_to_file`](@ref):
 full-jitter exponential backoff between retries (1s base, 60s cap), default
 cap of 10 attempts, pass `nothing` for unlimited.
+
+`frame_seconds = 60.0` (default) writes a fresh zstd frame every minute on
+each per-schema file for crash safety (multi-frame `.dbn.zst`; reads back as
+one continuous stream). Pass `nothing` to write a single frame.
 
 Example:
 ```julia
@@ -670,6 +815,7 @@ function stream_multi_to_files(; schemas::AbstractVector,
                                compress::Bool = true,
                                compress_level::Integer = 1,
                                rotate_seconds::Union{Nothing,Real} = nothing,
+                               frame_seconds::Union{Nothing,Real} = 60.0,
                                reconnect::Bool = true,
                                max_reconnect_attempts::Union{Integer,Nothing} = 10,
                                key = nothing,
@@ -695,6 +841,7 @@ function stream_multi_to_files(; schemas::AbstractVector,
             dataset = dataset, schema = sch, symbols = symbols, stype_in = stype_in,
             compress = compress, compress_level = compress_level,
             rotate_seconds = rotate_seconds,
+            frame_seconds = frame_seconds,
         )
         contexts[sch] = SessionContext(sch, SessionStats(schema = sch), file)
     end

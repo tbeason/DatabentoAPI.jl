@@ -120,6 +120,38 @@ function Base.show(io::IO, c::Live)
 end
 
 """
+    Live(f::Function, args...; kwargs...)
+
+Do-block form mirroring `Base.open(f, path)`. Constructs the client, runs
+`f(client)`, and guarantees `close(client)` in `finally` — so on
+`InterruptException` (Ctrl-C), an exception, or normal exit the socket and
+channels are torn down without the caller writing the `try/finally`
+themselves.
+
+```julia
+Live(dataset = "GLBX.MDP3") do client
+    connect!(client)
+    subscribe!(client; schema = Schema.TRADES, symbols = ["ES.FUT"], stype_in = SType.PARENT)
+    start!(client)
+    for rec in client
+        # … your code …
+    end
+end  # Ctrl-C here triggers a clean close(client)
+```
+
+The manual lifecycle (`Live(...)` → `connect!` → ... → `close(client)`) keeps
+working unchanged — this is purely additive.
+"""
+function Live(f::Function, args...; kwargs...)
+    client = Live(args...; kwargs...)
+    try
+        return f(client)
+    finally
+        try; close(client); catch; end
+    end
+end
+
+"""
     control_channel(client::Live) -> Channel{DBN.DBNRecord}
 
 Return the channel carrying control records (`ErrorMsg`, `SystemMsg`,
@@ -189,6 +221,9 @@ channel plus the control channel in typed mode).
 """
 function Base.close(c::Live)
     c.closed && return
+    # Flip the flag BEFORE any teardown so re-entry (e.g. user pressed
+    # Ctrl-C twice, or close() is called from a finally inside f()) is a
+    # no-op and doesn't double-close anything.
     c.closed = true
     try
         if c.connected && c.socket !== nothing && isopen(c.socket)
@@ -204,23 +239,23 @@ function Base.close(c::Live)
     catch
     end
     # Close every channel we own. Each in its own try so a single bad close
-    # doesn't leave others stranded.
+    # doesn't leave others stranded. Iteration runs regardless of c.typed
+    # because untyped clients have an empty typed_data_channels dict and a
+    # nothing control_channel, so the typed branches are no-ops.
     try
         c.channel === nothing || (isopen(c.channel) && close(c.channel))
     catch
     end
-    if c.typed
-        for ch in values(c.typed_data_channels)
-            try
-                isopen(ch) && close(ch)
-            catch
-            end
-        end
+    for ch in values(c.typed_data_channels)
         try
-            c.control_channel === nothing ||
-                (isopen(c.control_channel) && close(c.control_channel))
+            isopen(ch) && close(ch)
         catch
         end
+    end
+    try
+        c.control_channel === nothing ||
+            (isopen(c.control_channel) && close(c.control_channel))
+    catch
     end
     return nothing
 end
