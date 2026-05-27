@@ -85,6 +85,11 @@ function _reader_loop_typed(c::Live)
         buffered = DBN.BufferedReader(counting)
         decoder  = DBN.DBNDecoder(buffered)
         DBN.read_header!(decoder)
+        # Capture gateway Metadata.start_ts so the reconnect supervisor has
+        # a gap_end timestamp to report to user callbacks.
+        if decoder.metadata !== nothing
+            c.last_metadata_start_ns = Int64(decoder.metadata.start_ts)
+        end
 
         while !c.closed
             hd_result = try
@@ -177,11 +182,22 @@ function _reader_loop_typed(c::Live)
                 continue
             end
 
-            # Control rtypes → control channel via generic dispatch.
+            # Control rtypes → control channel via generic dispatch. An
+            # ErrorMsg sets c.terminal_error before publishing so the
+            # supervisor sees it once the reader exits and refuses to
+            # reconnect — gateway-side errors are deterministic and
+            # retrying would just re-hit the same condition.
             if rt == DBN.RType.ERROR_MSG ||
                rt == DBN.RType.SYSTEM_MSG ||
                rt == DBN.RType.SYMBOL_MAPPING_MSG
                 rec = DBN.read_record_dispatch(decoder, hd, rt)
+                if rec isa DBN.ErrorMsg
+                    try
+                        c.terminal_error = String(rec.err)
+                    catch
+                        c.terminal_error = "gateway ErrorMsg"
+                    end
+                end
                 if rec !== nothing && ctrl_chan !== nothing && isopen(ctrl_chan)
                     put!(ctrl_chan, rec)
                 end
@@ -251,6 +267,14 @@ end
             c.last_ts_recv_by_id[iid] = rec.ts_recv
         end
     end
+    # First record of this reader incarnation refreshes the retry budget —
+    # a session that successfully streams real data between drops keeps its
+    # full budget across the connection's lifetime.
+    if c.records_since_reconnect == 0
+        c.attempts_remaining = c.max_reconnect_attempts === nothing ?
+                               typemax(Int) : c.max_reconnect_attempts
+    end
+    c.records_since_reconnect += 1
     return nothing
 end
 
@@ -273,6 +297,11 @@ function _reader_loop(c::Live)
         buffered = DBN.BufferedReader(counting)
         decoder  = DBN.DBNDecoder(buffered)
         DBN.read_header!(decoder)
+        # Capture gateway Metadata.start_ts so the reconnect supervisor has
+        # a gap_end timestamp to report to user callbacks.
+        if decoder.metadata !== nothing
+            c.last_metadata_start_ns = Int64(decoder.metadata.start_ts)
+        end
         while !c.closed
             rec = try
                 DBN.read_record(decoder)

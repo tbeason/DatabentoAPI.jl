@@ -309,6 +309,12 @@ function Base.close(c::Live)
     # Ctrl-C twice, or close() is called from a finally inside f()) is a
     # no-op and doesn't double-close anything.
     c.closed = true
+    # Mark terminal state so the supervisor (if running) drops out at its
+    # next state check instead of attempting another reconnect against a
+    # socket we're about to tear down.
+    lock(c.state_lock) do
+        c.state = :closed
+    end
     try
         if c.connected && c.socket !== nothing && isopen(c.socket)
             try

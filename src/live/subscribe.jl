@@ -126,6 +126,16 @@ function start!(c::Live)
         bind_channels && bind(c.channel, c.reader_task)
     end
     c.started = true
+    lock(c.state_lock) do
+        c.state = :streaming
+    end
+    # Spawn the supervisor under RECONNECT so any reader exit is followed
+    # by a fresh socket + resubscribe + new reader writing into the same
+    # channels. Iteration and subscribe_callback consumers see a continuous
+    # record stream across drops.
+    if c.reconnect_policy != ReconnectPolicy.NONE
+        c.reconnect_supervisor = @async _supervisor_loop(c)
+    end
     return c
 end
 
