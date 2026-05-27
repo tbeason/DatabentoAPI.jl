@@ -204,19 +204,24 @@ function _reader_loop_typed(c::Live)
             end
         end
     finally
-        # Close every channel we own so any consumer task break out of its
-        # take! loop. The Live.close() path will also try this, but doing it
-        # here ensures cleanup on reader-side crash.
-        for ch in values(c.typed_data_channels)
+        # Channel teardown is conditional on the reconnect policy: under NONE
+        # there will be no replacement reader, so we close channels to signal
+        # consumers; under RECONNECT the supervisor will spawn a fresh reader
+        # against the same channels and closing here would terminate
+        # iteration mid-stream. The user-initiated close path (c.closed=true)
+        # always closes regardless, so explicit close(client) still works.
+        if c.reconnect_policy == ReconnectPolicy.NONE || c.closed
+            for ch in values(c.typed_data_channels)
+                try
+                    isopen(ch) && close(ch)
+                catch
+                end
+            end
             try
-                isopen(ch) && close(ch)
+                c.control_channel === nothing ||
+                    (isopen(c.control_channel) && close(c.control_channel))
             catch
             end
-        end
-        try
-            c.control_channel === nothing ||
-                (isopen(c.control_channel) && close(c.control_channel))
-        catch
         end
     end
     return nothing
@@ -312,9 +317,14 @@ function _reader_loop(c::Live)
             end
         end
     finally
-        try
-            isopen(c.channel) && close(c.channel)
-        catch
+        # See _reader_loop_typed for the policy rationale: under RECONNECT
+        # the channel outlives the reader so the supervisor can re-bind it
+        # to a fresh reader.
+        if c.reconnect_policy == ReconnectPolicy.NONE || c.closed
+            try
+                isopen(c.channel) && close(c.channel)
+            catch
+            end
         end
     end
     return nothing

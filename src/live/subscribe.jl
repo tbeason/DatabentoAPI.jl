@@ -104,17 +104,26 @@ function start!(c::Live)
 
     write_text_frame(c.socket; start_session = 0)
 
+    # Under ReconnectPolicy.NONE the reader task owns the channels' lifetime:
+    # `bind` closes them when the reader exits, which is the right shutdown
+    # signal for iterators / subscribe_callback loops since no new reader is
+    # coming. Under RECONNECT the channels are owned by the Live client and
+    # outlive any single reader incarnation — the supervisor (added later)
+    # respawns a reader writing into the same channels after each drop, so
+    # binding would prematurely terminate consumers across reconnects.
+    bind_channels = c.reconnect_policy == ReconnectPolicy.NONE
+
     if c.typed
         c.reader_task = @async _reader_loop_typed(c)
-        # Bind each typed data channel + the control channel to the reader
-        # task so they auto-close when the reader exits.
-        for ch in values(c.typed_data_channels)
-            bind(ch, c.reader_task)
+        if bind_channels
+            for ch in values(c.typed_data_channels)
+                bind(ch, c.reader_task)
+            end
+            bind(c.control_channel, c.reader_task)
         end
-        bind(c.control_channel, c.reader_task)
     else
         c.reader_task = @async _reader_loop(c)
-        bind(c.channel, c.reader_task)
+        bind_channels && bind(c.channel, c.reader_task)
     end
     c.started = true
     return c
