@@ -167,16 +167,12 @@ function control_channel(c::Live)
     return c.control_channel
 end
 
-"""
-    connect!(client)
-
-Open the TCP connection, perform the CRAM authentication handshake. After this returns,
-the client is ready for [`subscribe!`](@ref) calls. Throws `BentoAuthError` on failure.
-"""
-function connect!(c::Live)
-    c.connected && return c
-    c.closed && throw(ArgumentError("client is closed"))
-
+# Internal: open a TCP socket to the configured gateway and run the CRAM
+# authentication handshake, populating c.socket / c.lsg_version / c.session_id.
+# Does NOT touch lifecycle flags (c.connected, c.closed) so it can be reused
+# from both the public `connect!` entry and the upcoming reconnect path,
+# which manages those flags via its own state machine.
+function _open_socket_and_auth!(c::Live)
     c.socket = Sockets.connect(c.gateway, c.port)
 
     greeting = read_text_frame(c.socket)
@@ -208,6 +204,19 @@ function connect!(c::Live)
         throw(BentoAuthError("Live authentication failed: $err"))
     end
     c.session_id = get(auth_resp, "session_id", nothing)
+    return nothing
+end
+
+"""
+    connect!(client)
+
+Open the TCP connection, perform the CRAM authentication handshake. After this returns,
+the client is ready for [`subscribe!`](@ref) calls. Throws `BentoAuthError` on failure.
+"""
+function connect!(c::Live)
+    c.connected && return c
+    c.closed && throw(ArgumentError("client is closed"))
+    _open_socket_and_auth!(c)
     c.connected = true
     return c
 end
