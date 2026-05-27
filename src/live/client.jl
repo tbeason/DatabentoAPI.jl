@@ -67,6 +67,44 @@ mutable struct Live
     lsg_version::Union{Nothing,String}
     subscriptions::Vector{NamedTuple}
     next_sub_id::Int
+
+    # --- reconnect plumbing (wired up in subsequent commits) ---
+
+    # Replay bookkeeping. Reader populates these per record; on reconnect we
+    # pick the per-instrument minimum as the resubscribe start timestamp so
+    # the new connection bridges the gap for instruments seen pre-drop.
+    # BBO-family schemas key on ts_recv; others on ts_event.
+    last_ts_event_by_id::Dict{UInt32,Int64}
+    last_ts_recv_by_id::Dict{UInt32,Int64}
+    # Gateway Metadata.start from the most recent (re-)connection. Used as
+    # gap_end in the reconnect callback.
+    last_metadata_start_ns::Union{Nothing,Int64}
+
+    # Reconnect policy + retry budget.
+    reconnect_policy::ReconnectPolicy.T
+    max_reconnect_attempts::Union{Int,Nothing}
+    immediate_reconnect_attempts::Int
+    # Lifetime budget remaining; reset to max_reconnect_attempts whenever the
+    # new reader successfully delivers ≥1 data record (so a long-lived
+    # session that streams between drops keeps its full budget).
+    attempts_remaining::Int
+    records_since_reconnect::Int
+
+    # Reconnect-callback registry. Each callback receives
+    # `(gap_start_ns::Int64, gap_end_ns::Int64)`.
+    reconnect_callbacks::Vector{Any}
+    callbacks_lock::ReentrantLock
+
+    # Supervisor task + state machine. `state` advances through
+    # :fresh → :connecting → :connected → :streaming → :reconnecting → ...
+    # → :closed | :failed. `state_lock` guards transitions so close() racing
+    # the supervisor produces a deterministic shutdown.
+    reconnect_supervisor::Union{Nothing,Task}
+    state::Symbol
+    state_lock::ReentrantLock
+    # Set by the reader when a gateway ErrorMsg arrives; supervisor checks
+    # this and refuses to reconnect (transitions to :failed).
+    terminal_error::Union{Nothing,String}
 end
 
 function Live(key::Union{Nothing,AbstractString} = nothing;
@@ -79,7 +117,10 @@ function Live(key::Union{Nothing,AbstractString} = nothing;
               slow_reader_behavior::Union{Nothing,SlowReaderBehavior.T,AbstractString} = nothing,
               channel_size::Integer = 10_000,
               user_agent::AbstractString = USER_AGENT,
-              typed::Bool = false)
+              typed::Bool = false,
+              reconnect_policy::Union{ReconnectPolicy.T,Symbol,AbstractString} = ReconnectPolicy.NONE,
+              max_reconnect_attempts::Union{Integer,Nothing} = 10,
+              immediate_reconnect_attempts::Integer = 3)
     api_key = load_api_key(key)
     gw = gateway === nothing ? gateway_for_dataset(dataset) : String(gateway)
     srb = if slow_reader_behavior isa AbstractString
@@ -89,6 +130,14 @@ function Live(key::Union{Nothing,AbstractString} = nothing;
     end
     cmp = compression isa AbstractString ?
           getfield(Compression, Symbol(uppercase(compression))) : compression
+    rp = _coerce_reconnect_policy(reconnect_policy)
+    immediate_reconnect_attempts >= 0 || throw(ArgumentError(
+        "immediate_reconnect_attempts must be ≥ 0, got $immediate_reconnect_attempts"))
+    if max_reconnect_attempts !== nothing && max_reconnect_attempts < 0
+        throw(ArgumentError(
+            "max_reconnect_attempts must be ≥ 0 or `nothing` (unlimited), got $max_reconnect_attempts"))
+    end
+    init_budget = max_reconnect_attempts === nothing ? typemax(Int) : Int(max_reconnect_attempts)
 
     # Channels are built per-mode. Typed mode lazily creates per-schema data
     # channels in subscribe!; the control channel is constructed up front so
@@ -109,7 +158,33 @@ function Live(key::Union{Nothing,AbstractString} = nothing;
         false, false, false,
         nothing, nothing,
         NamedTuple[], 1,
+        # --- reconnect fields ---
+        Dict{UInt32,Int64}(), Dict{UInt32,Int64}(),
+        nothing,                                 # last_metadata_start_ns
+        rp,
+        max_reconnect_attempts === nothing ? nothing : Int(max_reconnect_attempts),
+        Int(immediate_reconnect_attempts),
+        init_budget,
+        0,                                       # records_since_reconnect
+        Any[], ReentrantLock(),
+        nothing,                                 # reconnect_supervisor
+        :fresh, ReentrantLock(),
+        nothing,                                 # terminal_error
     )
+end
+
+# Internal: accept ReconnectPolicy.T directly, or Symbol / String spellings
+# (`:none`/`"none"`, `:reconnect`/`"reconnect"`) for ergonomic call sites that
+# don't want to import the enum.
+function _coerce_reconnect_policy(rp)
+    rp isa ReconnectPolicy.T && return rp
+    s = rp isa Symbol ? rp : Symbol(uppercase(String(rp)))
+    # Allow both lowercase symbols and the enum-style uppercase strings.
+    sym = Symbol(uppercase(String(s)))
+    sym === :NONE      && return ReconnectPolicy.NONE
+    sym === :RECONNECT && return ReconnectPolicy.RECONNECT
+    throw(ArgumentError(
+        "reconnect_policy must be ReconnectPolicy.NONE or ReconnectPolicy.RECONNECT (or :none / :reconnect), got $(repr(rp))"))
 end
 
 function Base.show(io::IO, c::Live)
