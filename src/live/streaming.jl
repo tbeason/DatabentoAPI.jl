@@ -38,13 +38,23 @@ const _CONNECTION_POLL_S       = 0.5
 const _REPLAY_WINDOW_NS        = Int64(24 * 3600) * 1_000_000_000
 
 # Full-jitter exponential backoff (AWS-recommended): wait drawn uniformly from
-# [0, min(cap, base * 2^(attempt-1))). `attempt` is 1-based — `attempt=1` is
-# the delay before the first reconnect.
+# [0, min(cap, base * 2^(n-1))) where n is the backoff-phase attempt index.
+# `attempt` is 1-based — `attempt=1` is the delay before the first reconnect.
+#
+# Optional `immediate` phase: when `attempt <= immediate`, return 0.0 so the
+# first N reconnects fire with no sleep. Catches sub-second TCP blips that
+# recover within a few packet retransmits, which the 1s+ backoff would
+# otherwise stretch into multi-second downtime. The backoff phase starts at
+# `attempt = immediate + 1` and is indexed from there (so the first backoff
+# attempt still gets the small `base`-sized window, not a pre-stretched one).
 function _reconnect_delay(attempt::Integer;
+                          immediate::Integer = 0,
                           base::Real = _RECONNECT_BASE_S,
                           cap::Real  = _RECONNECT_CAP_S)
-    attempt < 1 && return 0.0
-    upper = min(float(cap), float(base) * 2.0^(attempt - 1))
+    attempt < 1         && return 0.0
+    attempt <= immediate && return 0.0
+    n = attempt - immediate
+    upper = min(float(cap), float(base) * 2.0^(n - 1))
     return rand() * upper
 end
 
