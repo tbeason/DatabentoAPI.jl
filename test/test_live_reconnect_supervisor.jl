@@ -216,3 +216,41 @@ end
     @test callback_count[] == 0                  # no reconnect callback fired
     @test length(seen) >= 1                      # got the pre-error trade
 end
+
+@testset "live_session bundles connect/subscribe/start + close" begin
+    bytes, n = _supervisor_dbn_bytes(3; ts_base = Int64(1_700_000_000_000_000_000),
+                                        id_base = 100)
+    script = function(sock)
+        _supervisor_handshake!(sock)
+        write(sock, bytes); flush(sock)
+        sleep(2.0)
+        close(sock)
+    end
+    mock = spawn_mock_gateway_sequence([script])
+
+    collected = DBN.DBNRecord[]
+    live_session(;
+        dataset = "TEST.MOCK",
+        subscriptions = [(; schema = DBN.Schema.TRADES,
+                            symbols = ["AAPL"],
+                            stype_in = DBN.SType.INSTRUMENT_ID)],
+        reconnect_policy = :none,          # single-shot for this smoke test
+        key = _SUPERVISOR_TEST_KEY,
+        gateway = "127.0.0.1", port = mock.port,
+        compression = DBN.Compression.NONE,
+    ) do client
+        deadline = time() + 10.0
+        while time() < deadline && length(collected) < n
+            try
+                push!(collected, take!(client.channel))
+            catch e
+                e isa InvalidStateException && break
+                rethrow()
+            end
+        end
+    end
+    try; wait(mock.accept_task); catch; end
+
+    @test length(collected) == n
+    @test all(r -> r isa DBN.TradeMsg, collected)
+end

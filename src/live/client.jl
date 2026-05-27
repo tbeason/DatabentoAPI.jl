@@ -227,6 +227,66 @@ function Live(f::Function, args...; kwargs...)
 end
 
 """
+    live_session(fn; dataset, subscriptions, reconnect_policy=:reconnect, kwargs...) -> result of fn
+
+Convenience wrapper that bundles `connect! → subscribe!(many) → start! → fn(client) → close`
+into a single do-block. Defaults `reconnect_policy = :reconnect` so iteration
+inside `fn` survives transient TCP drops by spawning the Live-layer reconnect
+supervisor (see [`add_reconnect_callback`](@ref)).
+
+`subscriptions` is a vector of NamedTuples describing one subscribe call each.
+Each entry must have `schema` and `symbols`; `stype_in` (default
+`SType.RAW_SYMBOL`), `snapshot` (default `false`), and `start` (default
+`nothing`) are optional.
+
+Any extra `kwargs` are forwarded to `Live(...)` — typically `key`, `gateway`,
+`port`, `compression`, `typed`, `max_reconnect_attempts`,
+`immediate_reconnect_attempts`.
+
+```julia
+live_session(; dataset = "GLBX.MDP3",
+               subscriptions = [(; schema = Schema.TRADES,
+                                  symbols = ["ES.FUT"],
+                                  stype_in = SType.PARENT)]) do client
+    add_reconnect_callback(client, (g0, g1) -> @info "gap" gap_s=(g1-g0)/1e9)
+    for rec in client
+        handle(rec)
+    end
+end
+```
+
+The lower-level `Live(...) do client; ...; end` do-block (introduced in 0.1.1)
+remains available for callers that need the explicit `connect!/subscribe!/start!`
+lifecycle — e.g. when conditional subscription requires inspecting `client.session_id`
+between the steps.
+"""
+function live_session(fn::Function;
+                     dataset::AbstractString,
+                     subscriptions,
+                     reconnect_policy::Union{ReconnectPolicy.T,Symbol,AbstractString} = :reconnect,
+                     key::Union{Nothing,AbstractString} = nothing,
+                     kwargs...)
+    isempty(subscriptions) && throw(ArgumentError(
+        "live_session requires at least one subscription"))
+    Live(key; dataset = dataset, reconnect_policy = reconnect_policy, kwargs...) do client
+        connect!(client)
+        for sub in subscriptions
+            haskey(sub, :schema)  || throw(ArgumentError("subscription missing :schema"))
+            haskey(sub, :symbols) || throw(ArgumentError("subscription missing :symbols"))
+            subscribe!(client;
+                schema   = sub.schema,
+                symbols  = sub.symbols,
+                stype_in = get(sub, :stype_in, SType.RAW_SYMBOL),
+                snapshot = get(sub, :snapshot, false),
+                start    = get(sub, :start, nothing),
+            )
+        end
+        start!(client)
+        return fn(client)
+    end
+end
+
+"""
     control_channel(client::Live) -> Channel{DBN.DBNRecord}
 
 Return the channel carrying control records (`ErrorMsg`, `SystemMsg`,

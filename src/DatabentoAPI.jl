@@ -107,6 +107,7 @@ export resolve
 # Live lifecycle
 export connect!, subscribe!, subscribe_callback, start!, stop!
 export channel, control_channel
+export live_session
 
 # Live capture to file
 export stream_to_file, stream_multi_to_files, default_live_path, read_capture
