@@ -396,6 +396,16 @@ function _replay_start_ts(stats::SessionStats, schema::Schema.T)
     return minimum(values(d))
 end
 
+# Live-owned replay state, populated by the reader's _record_replay! helper.
+# The Live-layer reconnect supervisor reads from this; the legacy
+# `_run_unified_session` reconnect loop still reads from its SessionStats copy
+# (this commit is additive — the streaming path is unaffected).
+function _replay_start_ts(c::Live, schema::Schema.T)
+    d = _is_bbo_family(schema) ? c.last_ts_recv_by_id : c.last_ts_event_by_id
+    isempty(d) && return nothing
+    return minimum(values(d))
+end
+
 function _log_status_alarm!(stats::SessionStats, rec::DBN.StatusMsg, schema::Schema.T)
     iid   = rec.hd.instrument_id
     state = (UInt16(rec.action), UInt8(rec.is_trading))
