@@ -48,8 +48,11 @@ end
 # and the function returns normally.
 ```
 
-For long-running captures that write to disk and survive disconnects, use
-[`stream_to_file`](@ref) — see [Capture to File](@ref).
+The Live client auto-reconnects on TCP drops by default (immediate-retry
+phase then exponential backoff). For long-running captures that *also*
+write to disk, use [`stream_to_file`](@ref) — see [Capture to File](@ref).
+For one-call setup that bundles `connect! → subscribe! → start!`, use
+[`live_session`](@ref) — see [Live Streaming](@ref).
 
 ## What next?
 
