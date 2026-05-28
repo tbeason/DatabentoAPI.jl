@@ -10,13 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Live-layer reconnect supervisor.** Reconnect handling moves into the
   `Live` client itself, so any consumer — `for rec in client`,
-  `subscribe_callback`, or `stream_to_file` — can benefit. Previously
+  `subscribe_callback`, or `stream_to_file` — benefits. Previously
   reconnect only existed inside the streaming layer; iteration consumers
-  silently saw an `InvalidStateException` on a TCP drop. Opt-in for now
-  via `reconnect_policy = :reconnect` on `Live(...)` (default still
-  `:none` in this release for backward compatibility; will flip to
-  `:reconnect` in a future release once the streaming-layer reconnect
-  loop has been merged into the same supervisor).
+  silently saw an `InvalidStateException` on a TCP drop. There is now
+  one reconnect codepath: `_run_unified_session` constructs a single
+  Live with `reconnect_policy = ReconnectPolicy.RECONNECT`, the
+  supervisor handles drops, and the streaming layer no longer carries
+  its own outer reconnect loop.
 - **Hybrid immediate-then-backoff retry schedule.** Under
   `reconnect_policy = :reconnect`, the first
   `immediate_reconnect_attempts` retries (default 3) fire with no sleep
@@ -45,6 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deterministic — retrying would just re-hit the same condition).
 
 ### Changed
+- **`Live(...)` default `reconnect_policy` is now `RECONNECT`.** Bare
+  `Live(...)` clients automatically reconnect on TCP drops. Pass
+  `reconnect_policy = :none` for the previous single-shot behaviour
+  (the reader's exit closes the channels and terminates iteration).
+- `_run_unified_session` no longer owns a reconnect loop — it leans on
+  the supervisor. `stream_to_file` / `stream_multi_to_files` users now
+  get the same immediate-then-backoff schedule as iteration consumers
+  (previously their first retry waited at least `_RECONNECT_BASE_S = 1s`).
+- `SessionStats.last_ts_event_by_id` / `last_ts_recv_by_id` removed —
+  replay bookkeeping lives entirely on `Live` (populated by the reader,
+  consumed by the supervisor). `_replay_start_ts` now only has the
+  `::Live` overload; the `::SessionStats` overload is gone.
 - `_reconnect_delay(attempt; immediate=0, base, cap)` gains the
   `immediate` kwarg. Default `0` preserves the v0.1.1 backoff curve
   exactly; the Live supervisor passes the user's

@@ -54,7 +54,8 @@ end
         bytes = _build_tiny_payload()
         mock = spawn_mock_gateway(_make_handshake_with(bytes))
         client = Live(TEST_API_KEY_2;
-            dataset = "GLBX.MDP3", gateway = "127.0.0.1", port = mock.port)
+            dataset = "GLBX.MDP3", gateway = "127.0.0.1", port = mock.port,
+            reconnect_policy = :none)
         connect!(client)
         @test_throws ArgumentError subscribe!(client;
             schema = Schema.TRADES, symbols = "ES.FUT",
@@ -68,7 +69,7 @@ end
         mock = spawn_mock_gateway(_make_handshake_with(bytes))
         client = Live(TEST_API_KEY_2;
             dataset = "GLBX.MDP3", gateway = "127.0.0.1", port = mock.port,
-            channel_size = 8)
+            channel_size = 8, reconnect_policy = :none)
         connect!(client)
         subscribe!(client; schema = Schema.TRADES, symbols = "ES.FUT",
                    stype_in = SType.PARENT)
@@ -95,7 +96,7 @@ end
         mock = spawn_mock_gateway(_make_handshake_with(bytes))
         client = Live(TEST_API_KEY_2;
             dataset = "GLBX.MDP3", gateway = "127.0.0.1", port = mock.port,
-            channel_size = 8)
+            channel_size = 8, reconnect_policy = :none)
         connect!(client)
         subscribe!(client; schema = Schema.TRADES, symbols = "ES.FUT")
         start!(client)
