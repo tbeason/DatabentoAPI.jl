@@ -217,6 +217,89 @@ end
     @test length(seen) >= 1                      # got the pre-error trade
 end
 
+@testset "live reconnect supervisor — ErrorMsg terminal under UNTYPED mode" begin
+    # Regression guard: with the default reconnect_policy = RECONNECT, an
+    # untyped client receiving a gateway ErrorMsg must NOT burn through
+    # max_reconnect_attempts re-hitting the same deterministic failure.
+    # The untyped reader sets c.terminal_error on ErrorMsg the same way the
+    # typed reader's control branch does.
+    metadata = DBN.Metadata(
+        DBN.DBN_VERSION, "TEST.MOCK", DBN.Schema.TRADES,
+        Int64(1_700_000_000_000_000_000), nothing, nothing, nothing,
+        DBN.SType.INSTRUMENT_ID, false,
+        ["AAPL"], String[], String[],
+        Tuple{String,String,Int64,Int64}[],
+    )
+    hd_trade = DBN.RecordHeader(UInt8(0), DBN.RType.MBP_0_MSG,
+                                 UInt16(1), UInt32(100),
+                                 Int64(1_700_000_000_000_000_000))
+    trade = DBN.TradeMsg(
+        hd_trade, Int64(150_000_000_000), UInt32(100),
+        DBN.Action.TRADE, DBN.Side.ASK, UInt8(0), UInt8(1),
+        Int64(1_700_000_000_000_000_000), Int32(0), UInt32(1),
+    )
+    hd_err = DBN.RecordHeader(UInt8(0), DBN.RType.ERROR_MSG,
+                               UInt16(1), UInt32(0),
+                               Int64(1_700_000_000_000_000_000))
+    err = DBN.ErrorMsg(hd_err, "untyped-fatal-test-err")
+    tmp, io = mktemp(); close(io)
+    bytes = try
+        DBN.write_dbn(tmp, metadata, DBN.DBNRecord[trade, err])
+        read(tmp)
+    finally
+        rm(tmp; force = true)
+    end
+
+    accept_count = Threads.Atomic{Int}(0)
+    script = function(sock)
+        Threads.atomic_add!(accept_count, 1)
+        _supervisor_handshake!(sock)
+        write(sock, bytes)
+        flush(sock)
+        sleep(2.0)
+        close(sock)
+    end
+    mock = spawn_mock_gateway_sequence([script for _ in 1:5])
+
+    client = Live(_SUPERVISOR_TEST_KEY;
+        dataset = "TEST.MOCK",
+        gateway = "127.0.0.1", port = mock.port,
+        compression = DBN.Compression.NONE,
+        # Default reconnect_policy = :reconnect — explicit here for clarity
+        # but the bug this test guards would manifest without specifying.
+        reconnect_policy = :reconnect,
+        max_reconnect_attempts = 5,
+    )
+    connect!(client)
+    subscribe!(client;
+        schema = DBN.Schema.TRADES, symbols = ["AAPL"],
+        stype_in = DBN.SType.INSTRUMENT_ID,
+    )
+    start!(client)
+
+    seen = DBN.DBNRecord[]
+    deadline = time() + 10.0
+    while time() < deadline
+        try
+            push!(seen, take!(client.channel))
+        catch e
+            e isa InvalidStateException && break
+            rethrow()
+        end
+    end
+    close(client)
+    if client.reconnect_supervisor !== nothing
+        try; wait(client.reconnect_supervisor); catch; end
+    end
+    try; close(mock.server); catch; end
+    try; wait(mock.accept_task); catch; end
+
+    @test accept_count[] == 1                       # never reconnected
+    @test client.terminal_error !== nothing         # ErrorMsg captured
+    @test any(r -> r isa DBN.TradeMsg, seen)        # pre-error trade got through
+    @test any(r -> r isa DBN.ErrorMsg, seen)        # ErrorMsg also flows to consumer
+end
+
 @testset "live_session bundles connect/subscribe/start + close" begin
     bytes, n = _supervisor_dbn_bytes(3; ts_base = Int64(1_700_000_000_000_000_000),
                                         id_base = 100)

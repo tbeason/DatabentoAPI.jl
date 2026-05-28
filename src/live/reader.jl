@@ -330,11 +330,24 @@ function _reader_loop(c::Live)
             # reconnect supervisor sees timestamps from records that haven't
             # been consumed yet.
             _record_replay!(c, rec)
+            # ErrorMsg sets c.terminal_error *before* the put! so the
+            # supervisor sees it once the reader exits and refuses to
+            # reconnect — gateway-side errors are deterministic and
+            # retrying just re-hits the same condition (and burns through
+            # max_reconnect_attempts for nothing). Mirrors the typed
+            # reader's control branch. The record still flows through the
+            # channel so consumers can inspect it. Users who want to
+            # treat ErrorMsg as informational (e.g. SkippedRecordsAfter-
+            # SlowReading) should use `reconnect_policy = :none` and
+            # handle reconnection themselves.
+            if rec isa DBN.ErrorMsg
+                try
+                    c.terminal_error = String(rec.err)
+                catch
+                    c.terminal_error = "gateway ErrorMsg"
+                end
+            end
             put!(c.channel, rec)
-            # ErrorMsg is informational on this stream (e.g. SkippedRecords-
-            # AfterSlowReading is a code-7 ErrorMsg signalling SKIP behavior, not a
-            # fatal error). Forward it through the channel and let the consumer
-            # decide; only EOF on the socket terminates the reader loop.
         end
     catch e
         # Suppress the "crashed" log on mid-stream EOF (same rationale as
