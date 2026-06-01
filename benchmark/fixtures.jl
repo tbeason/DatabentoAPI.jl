@@ -7,7 +7,7 @@ using TranscodingStreams
 
 const HERE      = @__DIR__
 const DATA_DIR  = joinpath(HERE, "data")
-const DBN_DATA  = abspath(joinpath(HERE, "..", "..", "DBN.jl", "benchmark", "data"))
+const DBN_DATA  = abspath(joinpath(HERE, "..", "..", "DatabentoBinaryEncoding.jl", "benchmark", "data"))
 
 # Sized fixtures. Tier names mirror DBN.jl's existing files when available.
 const SIZES = (
