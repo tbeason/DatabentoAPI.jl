@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-06-01
+
+### Changed
+- **Require `DatabentoBinaryEncoding` ≥ 0.1.2.** That release tolerates the
+  unset (`0xFF`) `stype` sentinel in v3 `SymbolMappingMsg` control records
+  (DatabentoBinaryEncoding.jl#23/#24). Before this, decoding a real v3 live
+  capture through the untyped/generic reader crashed with
+  `invalid value for Enum SType: 255` on the first symbol-mapping record —
+  so live OPRA streams and v3 capture replay were effectively undecodable.
+  Verified against a 12.6 GB `OPRA.PILLAR` cbbo-1s v3 capture: 5,000,000
+  records (incl. 73,003 `SymbolMappingMsg`) decode cleanly.
+
 ## [0.1.1] - 2026-05-26
 
 First release after v0.1.0. Bundles all work since the initial registry tag —
