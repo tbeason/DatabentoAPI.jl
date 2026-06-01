@@ -155,10 +155,16 @@ end
     end
     elapsed = time() - t0
 
-    # Should be roughly `duration_s` plus a small slack for the last in-flight
-    # sleep slice (≤ _CONNECTION_POLL_S = 0.5s) and handshake overhead. Without
-    # the fix, a single sleep of up to 60s could blow this out.
-    @test elapsed < duration + 3.0
+    # The call must return promptly after the deadline: `_wait_for_reconnect`
+    # slices its sleep so the loop never sits through a full backoff window
+    # (up to `_RECONNECT_CAP_S` = 60s) when the deadline lands mid-sleep. We
+    # assert a generous ceiling rather than a tight `duration + ε` — on shared
+    # macOS / Windows CI runners, per-attempt socket churn and scheduler stalls
+    # add several seconds of wall-clock unrelated to backoff responsiveness
+    # (the old `duration + 3.0` bound flaked here, observed 5.0s). Anything in
+    # the low-double-digits proves the in-flight sleep was cut short; a
+    # regression that ignored the deadline would run for tens of seconds.
+    @test elapsed < 15.0
     try; close(mock.server); catch; end
 end
 
