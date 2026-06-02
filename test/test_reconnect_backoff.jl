@@ -49,6 +49,34 @@ end
     @test length(unique(draws)) > 10
 end
 
+@testset "reconnect — immediate phase returns exactly 0.0" begin
+    # First `immediate` attempts must short-circuit to 0.0 so transient TCP
+    # blips recover without the 1s+ backoff floor.
+    for n in 1:3
+        @test _reconnect_delay(n; immediate = 3) === 0.0
+    end
+    # attempt = immediate + 1 enters backoff, drawn from [0, base).
+    for _ in 1:50
+        d = _reconnect_delay(4; immediate = 3)
+        @test 0 ≤ d < _RECONNECT_BASE_S
+    end
+    # attempt = immediate + 2 → [0, 2*base).
+    for _ in 1:50
+        d = _reconnect_delay(5; immediate = 3)
+        @test 0 ≤ d < 2 * _RECONNECT_BASE_S
+    end
+    # immediate = 0 (default) leaves prior behaviour unchanged: attempt=1
+    # samples [0, base) just like the no-kwarg form.
+    for _ in 1:50
+        d = _reconnect_delay(1; immediate = 0)
+        @test 0 ≤ d < _RECONNECT_BASE_S
+    end
+    # Large immediate suppresses backoff for any attempt within its window.
+    for n in 1:10
+        @test _reconnect_delay(n; immediate = 100) === 0.0
+    end
+end
+
 @testset "reconnect — max_reconnect_attempts caps connection attempts" begin
     # Mock gateway that immediately closes each socket. The client will fail
     # during the LSG-version read, raise, and fall through to the reconnect
@@ -127,10 +155,16 @@ end
     end
     elapsed = time() - t0
 
-    # Should be roughly `duration_s` plus a small slack for the last in-flight
-    # sleep slice (≤ _CONNECTION_POLL_S = 0.5s) and handshake overhead. Without
-    # the fix, a single sleep of up to 60s could blow this out.
-    @test elapsed < duration + 3.0
+    # The call must return promptly after the deadline: `_wait_for_reconnect`
+    # slices its sleep so the loop never sits through a full backoff window
+    # (up to `_RECONNECT_CAP_S` = 60s) when the deadline lands mid-sleep. We
+    # assert a generous ceiling rather than a tight `duration + ε` — on shared
+    # macOS / Windows CI runners, per-attempt socket churn and scheduler stalls
+    # add several seconds of wall-clock unrelated to backoff responsiveness
+    # (the old `duration + 3.0` bound flaked here, observed 5.0s). Anything in
+    # the low-double-digits proves the in-flight sleep was cut short; a
+    # regression that ignored the deadline would run for tens of seconds.
+    @test elapsed < 15.0
     try; close(mock.server); catch; end
 end
 

@@ -111,17 +111,20 @@ const _TEST_KEY = "db-1234567890abcdef12345"
 end
 
 @testset "live streaming — _replay_start_ts" begin
-    s = SessionStats(schema = Schema.TCBBO)
-    @test _replay_start_ts(s, Schema.TCBBO) === nothing
-    @test _replay_start_ts(s, Schema.TRADES) === nothing
+    # _replay_start_ts now reads from Live (populated by the reader's
+    # _record_replay! helper before each put!).
+    c = Live("db-0123456789abcdef0123456789abcdef"; dataset = "TEST.MOCK",
+             gateway = "127.0.0.1", port = 13000, reconnect_policy = :none)
+    @test _replay_start_ts(c, Schema.TCBBO) === nothing
+    @test _replay_start_ts(c, Schema.TRADES) === nothing
 
-    s.last_ts_event_by_id[UInt32(1)] = Int64(1_000_000)
-    s.last_ts_event_by_id[UInt32(2)] = Int64(3_000_000)
-    s.last_ts_recv_by_id[UInt32(1)]  = Int64(2_000_000)
-    s.last_ts_recv_by_id[UInt32(2)]  = Int64(5_000_000)
-    @test _replay_start_ts(s, Schema.TRADES) == Int64(1_000_000)        # min ts_event
-    @test _replay_start_ts(s, Schema.TCBBO)  == Int64(2_000_000)        # min ts_recv
-    @test _replay_start_ts(s, Schema.CBBO_1S) == Int64(2_000_000)
+    c.last_ts_event_by_id[UInt32(1)] = Int64(1_000_000)
+    c.last_ts_event_by_id[UInt32(2)] = Int64(3_000_000)
+    c.last_ts_recv_by_id[UInt32(1)]  = Int64(2_000_000)
+    c.last_ts_recv_by_id[UInt32(2)]  = Int64(5_000_000)
+    @test _replay_start_ts(c, Schema.TRADES) == Int64(1_000_000)        # min ts_event
+    @test _replay_start_ts(c, Schema.TCBBO)  == Int64(2_000_000)        # min ts_recv
+    @test _replay_start_ts(c, Schema.CBBO_1S) == Int64(2_000_000)
 end
 
 @testset "live streaming — status alarm dedup" begin

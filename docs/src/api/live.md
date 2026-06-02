@@ -26,3 +26,15 @@ stop!
 channel
 control_channel
 ```
+
+## Convenience
+
+```@docs
+live_session
+```
+
+## Reconnect
+
+```@docs
+add_reconnect_callback
+```

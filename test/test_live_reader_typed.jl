@@ -116,7 +116,8 @@ end
         dataset = "TEST.MOCK",
         gateway = "127.0.0.1", port = mock.port,
         channel_size = 64,
-        typed = true)
+        typed = true,
+        reconnect_policy = :none)
     DatabentoAPI.connect!(client)
     ch = DatabentoAPI.subscribe!(client;
         schema = Schema.TRADES, symbols = ["AAPL"],
@@ -203,7 +204,8 @@ end
         dataset = "TEST.MOCK",
         gateway = "127.0.0.1", port = mock.port,
         channel_size = 32,
-        typed = true)
+        typed = true,
+        reconnect_policy = :none)
     DatabentoAPI.connect!(client)
     ch_trades = DatabentoAPI.subscribe!(client;
         schema = Schema.TRADES, symbols = ["AAPL"], stype_in = SType.RAW_SYMBOL)
@@ -270,7 +272,8 @@ end
         dataset = "TEST.MOCK",
         gateway = "127.0.0.1", port = mock.port,
         channel_size = 32,
-        typed = true)
+        typed = true,
+        reconnect_policy = :none)
     DatabentoAPI.connect!(client)
     ch_1s = DatabentoAPI.subscribe!(client;
         schema = Schema.OHLCV_1S, symbols = ["AAPL"], stype_in = SType.RAW_SYMBOL)
@@ -336,7 +339,8 @@ end
         dataset = "TEST.MOCK",
         gateway = "127.0.0.1", port = mock.port,
         channel_size = 32,
-        typed = true)
+        typed = true,
+        reconnect_policy = :none)
     DatabentoAPI.connect!(client)
     ch_mbp1 = DatabentoAPI.subscribe!(client;
         schema = Schema.MBP_1, symbols = ["AAPL"], stype_in = SType.RAW_SYMBOL)
@@ -368,7 +372,8 @@ end
     client = DatabentoAPI.Live(_TEST_API_KEY_TYPED;
         dataset = "TEST.MOCK",
         gateway = "127.0.0.1", port = 1,   # no real connection needed for the check
-        typed = true)
+        typed = true,
+        reconnect_policy = :none)
     # Mark connected so subscribe! validation runs (we still won't make
     # a real socket call because subscribe! checks the schema first).
     client.connected = true

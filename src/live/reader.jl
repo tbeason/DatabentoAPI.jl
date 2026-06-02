@@ -85,6 +85,11 @@ function _reader_loop_typed(c::Live)
         buffered = DBN.BufferedReader(counting)
         decoder  = DBN.DBNDecoder(buffered)
         DBN.read_header!(decoder)
+        # Capture gateway Metadata.start_ts so the reconnect supervisor has
+        # a gap_end timestamp to report to user callbacks.
+        if decoder.metadata !== nothing
+            c.last_metadata_start_ns = Int64(decoder.metadata.start_ts)
+        end
 
         while !c.closed
             hd_result = try
@@ -112,72 +117,87 @@ function _reader_loop_typed(c::Live)
             # Hot path: data-record rtypes, type-stable put! to the
             # per-schema channel. Nullness check FIRST in each branch so
             # unsubscribed schemas short-circuit on a pointer comparison
-            # before the slower rtype enum comparison.
+            # before the slower rtype enum comparison. `_put_data!` updates
+            # per-instrument replay timestamps on the Live client before
+            # publishing, so the reconnect supervisor sees them.
             if ch_trades !== nothing && rt == DBN.RType.MBP_0_MSG
-                put!(ch_trades, DBN.read_trade_msg(decoder, hd))
+                _put_data!(c, ch_trades, DBN.read_trade_msg(decoder, hd))
                 continue
             elseif ch_mbo !== nothing && rt == DBN.RType.MBO_MSG
-                put!(ch_mbo, DBN.read_mbo_msg(decoder, hd))
+                _put_data!(c, ch_mbo, DBN.read_mbo_msg(decoder, hd))
                 continue
             elseif (ch_mbp1 !== nothing || ch_tbbo !== nothing) && rt == DBN.RType.MBP_1_MSG
                 # MBP_1 and TBBO both use MBP_1_MSG rtype + MBP1Msg layout.
                 # Broadcast so each subscribed channel receives the record.
+                # Single replay-state update — same record content.
                 rec = DBN.read_mbp1_msg(decoder, hd)
+                _record_replay!(c, rec)
                 ch_mbp1 !== nothing && put!(ch_mbp1, rec)
                 ch_tbbo !== nothing && put!(ch_tbbo, rec)
                 continue
             elseif ch_mbp10 !== nothing && rt == DBN.RType.MBP_10_MSG
-                put!(ch_mbp10, DBN.read_mbp10_msg(decoder, hd))
+                _put_data!(c, ch_mbp10, DBN.read_mbp10_msg(decoder, hd))
                 continue
             elseif ch_ohlcv_1s !== nothing && rt == DBN.RType.OHLCV_1S_MSG
-                put!(ch_ohlcv_1s, DBN.read_ohlcv_msg(decoder, hd))
+                _put_data!(c, ch_ohlcv_1s, DBN.read_ohlcv_msg(decoder, hd))
                 continue
             elseif ch_ohlcv_1m !== nothing && rt == DBN.RType.OHLCV_1M_MSG
-                put!(ch_ohlcv_1m, DBN.read_ohlcv_msg(decoder, hd))
+                _put_data!(c, ch_ohlcv_1m, DBN.read_ohlcv_msg(decoder, hd))
                 continue
             elseif ch_ohlcv_1h !== nothing && rt == DBN.RType.OHLCV_1H_MSG
-                put!(ch_ohlcv_1h, DBN.read_ohlcv_msg(decoder, hd))
+                _put_data!(c, ch_ohlcv_1h, DBN.read_ohlcv_msg(decoder, hd))
                 continue
             elseif ch_ohlcv_1d !== nothing && rt == DBN.RType.OHLCV_1D_MSG
-                put!(ch_ohlcv_1d, DBN.read_ohlcv_msg(decoder, hd))
+                _put_data!(c, ch_ohlcv_1d, DBN.read_ohlcv_msg(decoder, hd))
                 continue
             elseif ch_status !== nothing && rt == DBN.RType.STATUS_MSG
-                put!(ch_status, DBN.read_status_msg(decoder, hd))
+                _put_data!(c, ch_status, DBN.read_status_msg(decoder, hd))
                 continue
             elseif ch_def !== nothing && rt == DBN.RType.INSTRUMENT_DEF_MSG
-                put!(ch_def, DBN.read_instrument_def_msg(decoder, hd))
+                _put_data!(c, ch_def, DBN.read_instrument_def_msg(decoder, hd))
                 continue
             elseif ch_imbal !== nothing && rt == DBN.RType.IMBALANCE_MSG
-                put!(ch_imbal, DBN.read_imbalance_msg(decoder, hd))
+                _put_data!(c, ch_imbal, DBN.read_imbalance_msg(decoder, hd))
                 continue
             elseif ch_stat !== nothing && rt == DBN.RType.STAT_MSG
-                put!(ch_stat, DBN.read_stat_msg(decoder, hd))
+                _put_data!(c, ch_stat, DBN.read_stat_msg(decoder, hd))
                 continue
             elseif ch_cmbp1 !== nothing && rt == DBN.RType.CMBP_1_MSG
-                put!(ch_cmbp1, DBN.read_cmbp1_msg(decoder, hd))
+                _put_data!(c, ch_cmbp1, DBN.read_cmbp1_msg(decoder, hd))
                 continue
             elseif ch_cbbo1s !== nothing && rt == DBN.RType.CBBO_1S_MSG
-                put!(ch_cbbo1s, DBN.read_cbbo1s_msg(decoder, hd))
+                _put_data!(c, ch_cbbo1s, DBN.read_cbbo1s_msg(decoder, hd))
                 continue
             elseif ch_cbbo1m !== nothing && rt == DBN.RType.CBBO_1M_MSG
-                put!(ch_cbbo1m, DBN.read_cbbo1m_msg(decoder, hd))
+                _put_data!(c, ch_cbbo1m, DBN.read_cbbo1m_msg(decoder, hd))
                 continue
             elseif ch_tcbbo !== nothing && rt == DBN.RType.TCBBO_MSG
-                put!(ch_tcbbo, DBN.read_tcbbo_msg(decoder, hd))
+                _put_data!(c, ch_tcbbo, DBN.read_tcbbo_msg(decoder, hd))
                 continue
             elseif ch_bbo1s !== nothing && rt == DBN.RType.BBO_1S_MSG
-                put!(ch_bbo1s, DBN.read_bbo1s_msg(decoder, hd))
+                _put_data!(c, ch_bbo1s, DBN.read_bbo1s_msg(decoder, hd))
                 continue
             elseif ch_bbo1m !== nothing && rt == DBN.RType.BBO_1M_MSG
-                put!(ch_bbo1m, DBN.read_bbo1m_msg(decoder, hd))
+                _put_data!(c, ch_bbo1m, DBN.read_bbo1m_msg(decoder, hd))
                 continue
             end
 
-            # Control rtypes → control channel via generic dispatch.
+            # Control rtypes → control channel via generic dispatch. An
+            # ErrorMsg sets c.terminal_error before publishing so the
+            # supervisor sees it once the reader exits and refuses to
+            # reconnect — gateway-side errors are deterministic and
+            # retrying would just re-hit the same condition.
             if rt == DBN.RType.ERROR_MSG ||
                rt == DBN.RType.SYSTEM_MSG ||
                rt == DBN.RType.SYMBOL_MAPPING_MSG
                 rec = DBN.read_record_dispatch(decoder, hd, rt)
+                if rec isa DBN.ErrorMsg
+                    try
+                        c.terminal_error = String(rec.err)
+                    catch
+                        c.terminal_error = "gateway ErrorMsg"
+                    end
+                end
                 if rec !== nothing && ctrl_chan !== nothing && isopen(ctrl_chan)
                     put!(ctrl_chan, rec)
                 end
@@ -200,19 +220,24 @@ function _reader_loop_typed(c::Live)
             end
         end
     finally
-        # Close every channel we own so any consumer task break out of its
-        # take! loop. The Live.close() path will also try this, but doing it
-        # here ensures cleanup on reader-side crash.
-        for ch in values(c.typed_data_channels)
+        # Channel teardown is conditional on the reconnect policy: under NONE
+        # there will be no replacement reader, so we close channels to signal
+        # consumers; under RECONNECT the supervisor will spawn a fresh reader
+        # against the same channels and closing here would terminate
+        # iteration mid-stream. The user-initiated close path (c.closed=true)
+        # always closes regardless, so explicit close(client) still works.
+        if c.reconnect_policy == ReconnectPolicy.NONE || c.closed
+            for ch in values(c.typed_data_channels)
+                try
+                    isopen(ch) && close(ch)
+                catch
+                end
+            end
             try
-                isopen(ch) && close(ch)
+                c.control_channel === nothing ||
+                    (isopen(c.control_channel) && close(c.control_channel))
             catch
             end
-        end
-        try
-            c.control_channel === nothing ||
-                (isopen(c.control_channel) && close(c.control_channel))
-        catch
         end
     end
     return nothing
@@ -227,6 +252,39 @@ end
     return ch === nothing ? nothing : ch::Channel{T}
 end
 
+# Update per-instrument replay timestamps on the Live client. The supervisor
+# (added in a later commit) reads these to compute the resubscribe `start=`
+# value after a reconnect. `hasproperty` checks fold against the concrete
+# record type at each typed-reader callsite — zero overhead for records that
+# lack ts_recv (e.g. TradeMsg has only ts_event on .hd).
+@inline function _record_replay!(c::Live, rec)
+    if hasproperty(rec, :hd) && hasproperty(rec.hd, :instrument_id)
+        iid = rec.hd.instrument_id
+        if hasproperty(rec.hd, :ts_event)
+            c.last_ts_event_by_id[iid] = rec.hd.ts_event
+        end
+        if hasproperty(rec, :ts_recv)
+            c.last_ts_recv_by_id[iid] = rec.ts_recv
+        end
+    end
+    # First record of this reader incarnation refreshes the retry budget —
+    # a session that successfully streams real data between drops keeps its
+    # full budget across the connection's lifetime.
+    if c.records_since_reconnect == 0
+        c.attempts_remaining = c.max_reconnect_attempts === nothing ?
+                               typemax(Int) : c.max_reconnect_attempts
+    end
+    c.records_since_reconnect += 1
+    return nothing
+end
+
+# Typed-mode helper: update replay state and put the record on its channel.
+# Inlined so the put! stays monomorphic on the concrete channel eltype.
+@inline function _put_data!(c::Live, ch::Channel, rec)
+    _record_replay!(c, rec)
+    put!(ch, rec)
+end
+
 function _reader_loop(c::Live)
     try
         # Wrap with zstd decompressor first if the session was negotiated with
@@ -239,6 +297,11 @@ function _reader_loop(c::Live)
         buffered = DBN.BufferedReader(counting)
         decoder  = DBN.DBNDecoder(buffered)
         DBN.read_header!(decoder)
+        # Capture gateway Metadata.start_ts so the reconnect supervisor has
+        # a gap_end timestamp to report to user callbacks.
+        if decoder.metadata !== nothing
+            c.last_metadata_start_ns = Int64(decoder.metadata.start_ts)
+        end
         while !c.closed
             rec = try
                 DBN.read_record(decoder)
@@ -263,11 +326,28 @@ function _reader_loop(c::Live)
             # reliable enough on Windows for half-closed sockets to differentiate
             # safely without busy-looping.
             rec === nothing && break
+            # Track per-instrument replay state on the Live client so the
+            # reconnect supervisor sees timestamps from records that haven't
+            # been consumed yet.
+            _record_replay!(c, rec)
+            # ErrorMsg sets c.terminal_error *before* the put! so the
+            # supervisor sees it once the reader exits and refuses to
+            # reconnect — gateway-side errors are deterministic and
+            # retrying just re-hits the same condition (and burns through
+            # max_reconnect_attempts for nothing). Mirrors the typed
+            # reader's control branch. The record still flows through the
+            # channel so consumers can inspect it. Users who want to
+            # treat ErrorMsg as informational (e.g. SkippedRecordsAfter-
+            # SlowReading) should use `reconnect_policy = :none` and
+            # handle reconnection themselves.
+            if rec isa DBN.ErrorMsg
+                try
+                    c.terminal_error = String(rec.err)
+                catch
+                    c.terminal_error = "gateway ErrorMsg"
+                end
+            end
             put!(c.channel, rec)
-            # ErrorMsg is informational on this stream (e.g. SkippedRecords-
-            # AfterSlowReading is a code-7 ErrorMsg signalling SKIP behavior, not a
-            # fatal error). Forward it through the channel and let the consumer
-            # decide; only EOF on the socket terminates the reader loop.
         end
     catch e
         # Suppress the "crashed" log on mid-stream EOF (same rationale as
@@ -279,9 +359,14 @@ function _reader_loop(c::Live)
             end
         end
     finally
-        try
-            isopen(c.channel) && close(c.channel)
-        catch
+        # See _reader_loop_typed for the policy rationale: under RECONNECT
+        # the channel outlives the reader so the supervisor can re-bind it
+        # to a fresh reader.
+        if c.reconnect_policy == ReconnectPolicy.NONE || c.closed
+            try
+                isopen(c.channel) && close(c.channel)
+            catch
+            end
         end
     end
     return nothing

@@ -38,30 +38,24 @@ const _CONNECTION_POLL_S       = 0.5
 const _REPLAY_WINDOW_NS        = Int64(24 * 3600) * 1_000_000_000
 
 # Full-jitter exponential backoff (AWS-recommended): wait drawn uniformly from
-# [0, min(cap, base * 2^(attempt-1))). `attempt` is 1-based — `attempt=1` is
-# the delay before the first reconnect.
+# [0, min(cap, base * 2^(n-1))) where n is the backoff-phase attempt index.
+# `attempt` is 1-based — `attempt=1` is the delay before the first reconnect.
+#
+# Optional `immediate` phase: when `attempt <= immediate`, return 0.0 so the
+# first N reconnects fire with no sleep. Catches sub-second TCP blips that
+# recover within a few packet retransmits, which the 1s+ backoff would
+# otherwise stretch into multi-second downtime. The backoff phase starts at
+# `attempt = immediate + 1` and is indexed from there (so the first backoff
+# attempt still gets the small `base`-sized window, not a pre-stretched one).
 function _reconnect_delay(attempt::Integer;
+                          immediate::Integer = 0,
                           base::Real = _RECONNECT_BASE_S,
                           cap::Real  = _RECONNECT_CAP_S)
-    attempt < 1 && return 0.0
-    upper = min(float(cap), float(base) * 2.0^(attempt - 1))
+    attempt < 1         && return 0.0
+    attempt <= immediate && return 0.0
+    n = attempt - immediate
+    upper = min(float(cap), float(base) * 2.0^(n - 1))
     return rand() * upper
-end
-
-# Sleep up to `delay` seconds, but wake every `_CONNECTION_POLL_S` to check for
-# shutdown / deadline so a long backoff window doesn't pin `duration_s` or
-# `shutdown_requested[]` responsiveness. Matches the cadence of the main
-# coordination loop.
-function _wait_for_reconnect(delay::Float64, ctxs, deadline::Union{Nothing,Float64})
-    delay > 0.0 || return
-    deadline_at = time() + delay
-    while true
-        _any_shutdown(ctxs)                          && return
-        deadline !== nothing && time() >= deadline   && return
-        remaining = deadline_at - time()
-        remaining > 0 || return
-        sleep(min(_CONNECTION_POLL_S, remaining))
-    end
 end
 
 const _SPARSE_SCHEMAS = (Schema.STATUS, Schema.DEFINITION, Schema.IMBALANCE)
@@ -81,8 +75,8 @@ Base.@kwdef mutable struct SessionStats
     error::Union{Nothing,String} = nothing
     reconnects::Int    = 0
     last_record_at::Float64 = 0.0
-    last_ts_event_by_id::Dict{UInt32,Int64} = Dict{UInt32,Int64}()
-    last_ts_recv_by_id::Dict{UInt32,Int64}  = Dict{UInt32,Int64}()
+    # Per-instrument replay timestamps moved to Live (populated by reader,
+    # consumed by reconnect supervisor) — see Live.last_ts_*_by_id.
     status_state_by_id::Dict{UInt32,Tuple{UInt16,UInt8}} = Dict{UInt32,Tuple{UInt16,UInt8}}()
     alarm_status_count::Int = 0
 end
@@ -380,8 +374,13 @@ _is_bbo_family(s::Schema.T) = s in (
     Schema.TBBO,    Schema.TCBBO,
 )
 
-function _replay_start_ts(stats::SessionStats, schema::Schema.T)
-    d = _is_bbo_family(schema) ? stats.last_ts_recv_by_id : stats.last_ts_event_by_id
+# Replay-state lookup used by the reconnect supervisor. Reads from the
+# Live's per-instrument timestamp dicts (populated by the reader's
+# `_record_replay!`). Returns the minimum-across-instruments — the earliest
+# point we lost coverage on any subscribed instrument, which is the safest
+# resubscribe `start=` value (replays a bit more rather than skipping).
+function _replay_start_ts(c::Live, schema::Schema.T)
+    d = _is_bbo_family(schema) ? c.last_ts_recv_by_id : c.last_ts_event_by_id
     isempty(d) && return nothing
     return minimum(values(d))
 end
@@ -401,22 +400,13 @@ function _log_status_alarm!(stats::SessionStats, rec::DBN.StatusMsg, schema::Sch
     return nothing
 end
 
-# Data-record path: writes the record to disk + tracks per-instrument
-# replay timestamps. Under typed mode this runs once per record off the
-# typed data channel; the record type is concrete at the call site.
+# Data-record path: writes the record to disk + bumps counters. Replay
+# bookkeeping is owned by the Live client (see Live.last_ts_*_by_id,
+# populated by the reader's _record_replay! before the put!).
 function _handle_data!(ctx::SessionContext, rec)
     s = ctx.stats
     s.data_count    += 1
     s.last_record_at = time()
-    if hasproperty(rec, :hd) && hasproperty(rec.hd, :instrument_id)
-        iid = rec.hd.instrument_id
-        if hasproperty(rec.hd, :ts_event)
-            s.last_ts_event_by_id[iid] = rec.hd.ts_event
-        end
-        if hasproperty(rec, :ts_recv)
-            s.last_ts_recv_by_id[iid] = rec.ts_recv
-        end
-    end
     # StatusMsg additionally checks for alarm-worthy state transitions.
     if rec isa DBN.StatusMsg
         _log_status_alarm!(s, rec, ctx.schema)
@@ -532,99 +522,140 @@ function _run_unified_session(ctxs::Dict{Schema.T,SessionContext};
                               channel_size::Integer,
                               start_initial,
                               snapshot::Bool)
-    # Stable subscribe! order so reconnect re-subscribes in the same sequence.
+    # Stable subscribe! order keeps any future replay log deterministic.
     schemas = sort!(collect(keys(ctxs)); by = s -> Int(s))
-    while true
-        _any_shutdown(ctxs)                              && return
-        deadline !== nothing && time() >= deadline       && return
 
-        client = Live(key;
-            dataset = String(dataset),
-            gateway = gateway, port = port,
-            ts_out = false,
-            compression = wire_compression,
-            heartbeat_interval = heartbeat_interval,
-            slow_reader_behavior = slow_reader_behavior,
-            channel_size = channel_size,
-            typed = true,
-        )
-        for ctx in values(ctxs); ctx.current_client = client; end
+    # Single Live for the lifetime of this session. Under reconnect=true,
+    # the Live-layer supervisor reopens the socket + replays subscriptions
+    # internally; the streaming layer no longer owns a reconnect loop.
+    client = Live(key;
+        dataset = String(dataset),
+        gateway = gateway, port = port,
+        ts_out = false,
+        compression = wire_compression,
+        heartbeat_interval = heartbeat_interval,
+        slow_reader_behavior = slow_reader_behavior,
+        channel_size = channel_size,
+        typed = true,
+        reconnect_policy = reconnect ? ReconnectPolicy.RECONNECT : ReconnectPolicy.NONE,
+        max_reconnect_attempts = max_reconnect_attempts,
+    )
+    for ctx in values(ctxs); ctx.current_client = client; end
 
-        data_channels  = Dict{Schema.T,Any}()
-        consumer_tasks = Dict{Schema.T,Task}()
-        ctrl_drainer::Union{Nothing,Task} = nothing
-        try
-            connect!(client)
-            for sch in schemas
-                ctx = ctxs[sch]
-                start_ts = ctx.stats.reconnects == 0 ? start_initial :
-                                                      _replay_start_ts(ctx.stats, sch)
-                start_ts = _bound_replay(start_ts)
-                data_channels[sch] = subscribe!(client;
-                    schema   = sch,
-                    symbols  = symbols,
-                    stype_in = stype_in,
-                    snapshot = snapshot,
-                    start    = start_ts,
-                )
-            end
-            start!(client)
+    # Mirror the supervisor's reconnect successes into per-schema stats so
+    # the existing stats-based monitoring (heartbeat log, smoke assertions,
+    # potential dashboards) keeps its `reconnects` counter live.
+    if reconnect
+        add_reconnect_callback(client, (_g0, _g1) -> begin
+            for ctx in values(ctxs); ctx.stats.reconnects += 1; end
+        end)
+    end
 
-            ctrl_drainer = @async _drain_control!(ctxs, control_channel(client))
-            for sch in schemas
-                ctx = ctxs[sch]
-                ch  = data_channels[sch]
-                consumer_tasks[sch] = @async _drain_data!(ctx, ch, deadline)
-            end
-
-            # Main coordination loop: poll for shutdown/deadline/error and
-            # service per-schema flush requests. Exits when every consumer
-            # task has finished (reader closed all channels) or the loop is
-            # told to stop.
+    data_channels  = Dict{Schema.T,Any}()
+    consumer_tasks = Dict{Schema.T,Task}()
+    ctrl_drainer::Union{Nothing,Task} = nothing
+    try
+        # Initial connect with retry. The Live-layer supervisor only
+        # kicks in after start! (it watches the reader task), so a
+        # gateway that hangs up mid-handshake on the *first* attempt
+        # would otherwise abort the whole session. Retry per the same
+        # cadence — immediate phase then exp backoff — bounded by
+        # max_reconnect_attempts (1 + cap total attempts: initial + cap
+        # retries).
+        connect_attempt = 0
+        while true
             try
-                while !all(istaskdone, values(consumer_tasks))
-                    _any_shutdown(ctxs)                              && break
-                    deadline !== nothing && time() >= deadline       && break
-                    _any_error(ctxs)                                 && break
-                    for ctx in values(ctxs)
-                        while isready(ctx.flush_request)
-                            try; take!(ctx.flush_request); catch; end
-                            _flush!(ctx.file)
-                        end
-                    end
-                    sleep(_CONNECTION_POLL_S)
-                end
+                connect!(client)
+                break
             catch e
-                if !(e isa InvalidStateException) && !_any_shutdown(ctxs)
-                    @warn "live session error" schemas=schemas exception=(e, catch_backtrace())
+                e isa InvalidStateException && rethrow()
+                connect_attempt += 1
+                if reconnect && (max_reconnect_attempts === nothing ||
+                                 connect_attempt <= max_reconnect_attempts)
+                    for ctx in values(ctxs); ctx.stats.reconnects += 1; end
+                    delay = _reconnect_delay(connect_attempt;
+                                              immediate = client.immediate_reconnect_attempts)
+                    @warn "live initial connect failed — retrying" attempt=connect_attempt delay_s=round(delay; digits=2)
+                    sleep(delay)
+                    if _any_shutdown(ctxs) ||
+                       (deadline !== nothing && time() >= deadline)
+                        rethrow()
+                    end
+                    continue
                 end
+                if reconnect
+                    @warn "live initial connect — retry budget exhausted" attempts=connect_attempt limit=max_reconnect_attempts
+                end
+                rethrow()
+            end
+        end
+
+        for sch in schemas
+            ctx = ctxs[sch]
+            # First-subscription start_ts comes from the caller. After a
+            # reconnect the supervisor recomputes per-schema via
+            # _replay_start_ts(c::Live, schema) and re-issues subscribe
+            # frames itself — no streaming-level branching needed here.
+            start_ts = _bound_replay(start_initial)
+            data_channels[sch] = subscribe!(client;
+                schema   = sch,
+                symbols  = symbols,
+                stype_in = stype_in,
+                snapshot = snapshot,
+                start    = start_ts,
+            )
+        end
+        start!(client)
+
+        ctrl_drainer = @async _drain_control!(ctxs, control_channel(client))
+        for sch in schemas
+            ctx = ctxs[sch]
+            ch  = data_channels[sch]
+            consumer_tasks[sch] = @async _drain_data!(ctx, ch, deadline)
+        end
+
+        # Main coordination loop: poll for shutdown/deadline/error and
+        # service per-schema flush requests. Exits when every consumer task
+        # has finished — supervisor reaching a terminal state (:failed /
+        # :closed) closes the channels, which makes the take!s raise
+        # InvalidStateException and the drainers return. Also exits on
+        # explicit shutdown/deadline/error so we close(client) below and
+        # tell the supervisor to stop reconnecting.
+        try
+            while !all(istaskdone, values(consumer_tasks))
+                _any_shutdown(ctxs)                              && break
+                deadline !== nothing && time() >= deadline       && break
+                _any_error(ctxs)                                 && break
+                for ctx in values(ctxs)
+                    while isready(ctx.flush_request)
+                        try; take!(ctx.flush_request); catch; end
+                        _flush!(ctx.file)
+                    end
+                end
+                sleep(_CONNECTION_POLL_S)
             end
         catch e
             if !(e isa InvalidStateException) && !_any_shutdown(ctxs)
                 @warn "live session error" schemas=schemas exception=(e, catch_backtrace())
             end
-        finally
-            for ctx in values(ctxs); ctx.current_client = nothing; end
-            try; close(client); catch; end
-            # Closing the client closes every typed channel + the control
-            # channel; wait for drainers to flush in-flight records.
-            for t in values(consumer_tasks); try; wait(t); catch; end; end
-            ctrl_drainer === nothing || (try; wait(ctrl_drainer); catch; end)
         end
-
-        _any_shutdown(ctxs)                              && return
-        _any_error(ctxs)                                 && return
-        !reconnect                                       && return
-        deadline !== nothing && time() >= deadline       && return
-        for ctx in values(ctxs); ctx.stats.reconnects += 1; end
-        attempt = first(values(ctxs)).stats.reconnects
-        if max_reconnect_attempts !== nothing && attempt > max_reconnect_attempts
-            @warn "live reconnect attempts exhausted — giving up" schemas=schemas attempts=attempt limit=max_reconnect_attempts
-            return
+    catch e
+        if !(e isa InvalidStateException) && !_any_shutdown(ctxs)
+            @warn "live session error" schemas=schemas exception=(e, catch_backtrace())
         end
-        delay = _reconnect_delay(attempt)
-        @warn "live disconnect — reconnecting" schemas=schemas attempt=attempt delay_s=round(delay; digits=2)
-        _wait_for_reconnect(delay, ctxs, deadline)
+    finally
+        for ctx in values(ctxs); ctx.current_client = nothing; end
+        # close(client) transitions supervisor state→:closed (its next
+        # check exits cleanly) and closes every typed channel + the
+        # control channel; wait for drainers to flush in-flight records.
+        try; close(client); catch; end
+        for t in values(consumer_tasks); try; wait(t); catch; end; end
+        ctrl_drainer === nothing || (try; wait(ctrl_drainer); catch; end)
+        # Let the supervisor finish its current iteration so any in-flight
+        # reconnect attempt observes c.closed and exits.
+        if client.reconnect_supervisor !== nothing
+            try; wait(client.reconnect_supervisor); catch; end
+        end
     end
 end
 

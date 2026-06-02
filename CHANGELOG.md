@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Live-layer reconnect supervisor.** Reconnect handling moves into the
+  `Live` client itself, so any consumer — `for rec in client`,
+  `subscribe_callback`, or `stream_to_file` — benefits. Previously
+  reconnect only existed inside the streaming layer; iteration consumers
+  silently saw an `InvalidStateException` on a TCP drop. There is now
+  one reconnect codepath: `_run_unified_session` constructs a single
+  Live with `reconnect_policy = ReconnectPolicy.RECONNECT`, the
+  supervisor handles drops, and the streaming layer no longer carries
+  its own outer reconnect loop.
+- **Hybrid immediate-then-backoff retry schedule.** Under
+  `reconnect_policy = :reconnect`, the first
+  `immediate_reconnect_attempts` retries (default 3) fire with no sleep
+  to catch sub-second TCP blips, then fall back to PR #16's full-jitter
+  exponential backoff (1s base, 60s cap). The retry budget refreshes
+  whenever the new reader successfully delivers ≥1 data record, so a
+  long-lived session that streams real data between drops keeps its
+  full `max_reconnect_attempts` budget across the connection lifetime.
+- **`add_reconnect_callback(client, cb)`.** Register
+  `cb(gap_start_ns::Int64, gap_end_ns::Int64)` to observe each successful
+  reconnect. `gap_start_ns` is the min per-instrument timestamp seen
+  pre-drop; `gap_end_ns` is the gateway's `Metadata.start_ts` from the
+  freshly reconnected session. Useful for gap-fill from historical,
+  alerting, or metric emission. Callbacks are lock-protected and
+  errors are logged-and-swallowed.
+- **`live_session(fn; dataset, subscriptions, kwargs...)`.** Convenience
+  do-block bundling `connect! → subscribe!(many) → start! → fn(client)
+  → close`. Defaults `reconnect_policy = :reconnect` so the simple-API
+  path gets the supervisor by default.
+- **`ReconnectPolicy.{NONE, RECONNECT}` enum is now load-bearing.**
+  Previously exposed for parity but unused by code; now drives whether
+  `start!` spawns the supervisor task.
+- Gateway `ErrorMsg` records in typed mode now set
+  `client.terminal_error` *before* being forwarded to `control_channel`,
+  so the supervisor refuses to reconnect (gateway-side errors are
+  deterministic — retrying would just re-hit the same condition).
+
+### Changed
+- **`Live(...)` default `reconnect_policy` is now `RECONNECT`.** Bare
+  `Live(...)` clients automatically reconnect on TCP drops. Pass
+  `reconnect_policy = :none` for the previous single-shot behaviour
+  (the reader's exit closes the channels and terminates iteration).
+- `_run_unified_session` no longer owns a reconnect loop — it leans on
+  the supervisor. `stream_to_file` / `stream_multi_to_files` users now
+  get the same immediate-then-backoff schedule as iteration consumers
+  (previously their first retry waited at least `_RECONNECT_BASE_S = 1s`).
+- `SessionStats.last_ts_event_by_id` / `last_ts_recv_by_id` removed —
+  replay bookkeeping lives entirely on `Live` (populated by the reader,
+  consumed by the supervisor). `_replay_start_ts` now only has the
+  `::Live` overload; the `::SessionStats` overload is gone.
+- `_reconnect_delay(attempt; immediate=0, base, cap)` gains the
+  `immediate` kwarg. Default `0` preserves the v0.1.1 backoff curve
+  exactly; the Live supervisor passes the user's
+  `immediate_reconnect_attempts`.
+- Under `reconnect_policy = :reconnect`, `start!` does NOT bind the
+  user-facing channels to the reader task. The channels are owned by
+  the Live client and outlive any single reader incarnation so the
+  supervisor can respawn a reader writing into the same channels.
+  Channels are still closed explicitly by `Base.close(client)` and on
+  supervisor terminal-state transitions (`:failed` / `:closed`), so
+  iteration consumers still terminate cleanly on user shutdown.
+
 ## [0.1.1] - 2026-05-26
 
 First release after v0.1.0. Bundles all work since the initial registry tag —

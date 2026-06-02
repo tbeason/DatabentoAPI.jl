@@ -498,3 +498,134 @@ Per-suite invocations (faster iteration):
 julia --project=benchmark -e 'include("benchmark/bench_dbn_read.jl"); BenchDBNRead.run(tiers = (:small, :medium))'
 julia --project=benchmark -e 'include("benchmark/profile_hotspots.jl"); ProfileHotspots.run(tier = :medium, seconds = 5.0)'
 ```
+
+---
+
+# Reconnect-supervisor regression analysis (PR #22)
+
+**Date:** 2026-06-01 · **Hardware:** Windows 11 (10.0.26200), x86_64, 24 logical
+cores, 64 GB · **Julia:** 1.13.0-beta3 · **Method:** A/B of `origin/main`
+(7a91c6c) vs `feat/live-reconnect-supervisor` (59cee8c) in two git worktrees,
+each devving its own branch's `DatabentoAPI` source through an *identical*
+benchmark harness so only the package source differs.
+
+### The change under test
+
+PR #22 adds `_record_replay!(c::Live, rec)` to the reader hot path
+(`src/live/reader.jl`). It updates two per-instrument `Dict{UInt32,Int64}` maps
+(`last_ts_event_by_id`, `last_ts_recv_by_id`) and refreshes the retry budget on
+every data record, so the reconnect supervisor can compute the resubscribe
+`start=` after a TCP drop. On `main` the *reader* does a bare `put!`; the same
+two Dict writes lived in `_handle_data!` on the **`stream_to_file` consumer
+loop** (`streaming.jl`). The PR **relocates** those writes consumer→producer
+(and removes them from the consumer).
+
+### Why the obvious benchmark hides the cost
+
+The replay/firehose benches are **channel-bound** — the consumer `take!` loop
+is the floor and the channel saturates (see "Replay-stress" above). In that
+regime producer-side work has slack and is invisible to end-to-end throughput.
+Confirmed: the end-to-end SPY.OPT A/B (7.72 M CBBO records, identical harness,
+5 samples) is dominated by Union-channel GC noise — GC fraction swings
+4.8 %↔13.2 % between otherwise-identical configs and `:reconnect` sometimes
+"beats" `:none`, i.e. the ±10–15 % run-to-run noise is larger than the effect:
+
+| config | wire | M rec/s (median [min–max]) |
+|---|---|---|
+| main          | plain | 3.90 [3.42–4.04] |
+| PR `:none`     | plain | 3.18 [3.06–3.42] |
+| PR `:reconnect`| plain | 3.60 [3.02–3.79] |
+| main          | zstd  | 2.16 [2.10–2.36] |
+| PR `:none`     | zstd  | 2.00 [1.94–2.09] |
+| PR `:reconnect`| zstd  | 1.97 [1.91–1.97] |
+
+So the headline number must come from an **isolated** measurement, not the
+saturated pipeline.
+
+### Isolated per-record cost (the load-bearing measurement)
+
+In-process decode of the real SPY.OPT CBBO bytes (13,604 distinct
+instrument_ids — real OPRA cardinality) through the reader's exact pipeline
+(`CountingIO → BufferedReader → DBNDecoder`), **no channel/consumer**, min of 9
+(`benchmark` tmp driver, reproducible):
+
+| arm | ns/record | M rec/s |
+|---|---|---|
+| A — decode only (≈ main reader inner work)        | 40.4 | 24.8 |
+| B — decode + `_record_replay!` (≈ PR reader work) | 68.5 | 14.6 |
+| **Δ added by `_record_replay!`** | **+28 ns/rec** | — |
+
+Microbench of `_record_replay!` alone vs instrument cardinality M (2 M synthetic
+TradeMsg, both Dicts exercised — TradeMsg carries `ts_recv`), **steady state**:
+
+| M (distinct iids) | 1 | 100 | 1 000 | 50 000 | 200 000 |
+|---|---|---|---|---|---|
+| ns/record | 8.0 | 8.5 | 8.8 | 17.6 | 23.2 |
+| bytes/record | 0 | 0 | 0 | 0 | 0 |
+
+Per-record cost is **allocation-free** (writes hit existing Dict capacity) and
+scales mildly with cardinality (cache pressure on larger Dicts). The 28 ns on
+real CBBO data sits above the synthetic 23 ns at 200 k because the real records
+are larger and the two Dict probes miss cache more often.
+
+One-time memory: the two Dicts grow to the subscribed instrument universe —
+**1.6 MB at 13.6 k instruments, 13 MB at 200 k, ~104 MB for a full ~1.5 M
+OPRA-universe subscription** (≈70–125 bytes/instrument). Bounded, not
+per-record.
+
+### Verdict — net effect by consumer
+
+- **`stream_to_file`: no regression.** The two Dict writes merely moved from the
+  consumer thread to the reader thread; total work per record is unchanged. The
+  reader's 14.6 M rec/s decode+bookkeeping ceiling is far above any disk+zstd
+  consumer, so the reader is never the bottleneck → end-to-end unaffected.
+- **`for rec in client` / `subscribe_callback`: small added cost.** These
+  consumers did *no* replay bookkeeping on `main` (and had no reconnect support).
+  PR adds ~28 ns/record — measurable only when the consumer is trivial
+  (synthetic `bench_live_reader` single-symbol: 7.03→6.62 M rec/s plain,
+  **−5.8 %**, identical 8.17 MB alloc); masked to ~0 under any real consumer or
+  realistic arrival rate. For context, the real OPRA gateway delivers these
+  10-name subscriptions at ~288 k rec/s (see "Live-network stress" above) — 50×
+  below the decode+bookkeeping ceiling. No production impact.
+- **Allocation: no regression.** Per-record allocation is unchanged (0
+  bytes/rec added); the only new allocation is the bounded one-time Dict growth
+  above.
+
+### Optimization opportunity (not blocking)
+
+Under `reconnect_policy = :none` the bookkeeping in `_record_replay!` is never
+read (nothing reconnects), yet it still runs on every record. Gating the Dict
+writes on `policy != NONE` would return single-shot consumers to the `main` hot
+path exactly. Low-risk, ~28 ns/record back for `:none` users.
+
+### Two issues surfaced while building this analysis
+
+1. **Benchmark harness was broken after the `DBN.jl → DatabentoBinaryEncoding.jl`
+   rename.** `benchmark/Project.toml` still declared `DBN = {path =
+   "../../DBN.jl"}` and `fixtures.jl` pointed `DBN_DATA` at the old path, while
+   the bench `.jl` files already `import DatabentoBinaryEncoding` — so the suite
+   could not be instantiated. Fixed in this PR (Project.toml dep + source,
+   `fixtures.jl` path). The PR's original perf table could not have come from the
+   committed harness.
+2. **DBN v3 live captures crash the untyped reader** with `ArgumentError:
+   invalid value for Enum SType: 255` on the first symbol-mapping/control record
+   (reproduced on both Julia- and Python-captured `OPRA.PILLAR` cbbo-1s files;
+   the v1 `SPY.OPT` batch fixture decodes fine). This is a pre-existing decoder
+   gap in `DatabentoBinaryEncoding.jl` (255 = unset stype not mapped), **present
+   on both `main` and this PR** — orthogonal to #22, but it blocks using real v3
+   live captures as throughput fixtures and likely affects real v3 live
+   streaming through the generic reader. Worth a separate issue.
+
+### How to reproduce this section
+
+```bash
+# Decompress the clean v1 fixture once
+julia --project=benchmark -e 'using CodecZstd,TranscodingStreams; \
+  open("/tmp/SPY_plain.dbn","w") do o; open(f->write(o,TranscodingStream(ZstdDecompressor(),f)), \
+  "benchmark/data/replay_SPY.OPT_2026-05-13T13_30_00__2026-05-13T13_31_00.dbn.zst"); end'
+
+# End-to-end A/B (run in a main worktree and a PR worktree)
+julia --project=benchmark -e 'include("benchmark/bench_live_replay.jl"); using .BenchLiveReplay; \
+  BenchLiveReplay.replay(path="benchmark/data/replay_SPY.OPT_….dbn.zst", schema=Schema.CBBO_1S, \
+                         reconnect_policy=:none)'   # add reconnect_policy only on the PR branch
+```
