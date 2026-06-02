@@ -79,6 +79,7 @@ const TEST_CHALLENGE = "abcdef0123456789"
         gateway = "127.0.0.1",
         port    = mock.port,
         channel_size = 16,
+        reconnect_policy = :none,
     )
     connect!(client)
     @test client.connected

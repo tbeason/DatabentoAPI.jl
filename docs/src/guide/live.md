@@ -135,22 +135,104 @@ end
 slow-reader logic. Bursty schemas paired with a slow disk archive benefit
 from larger sizes.
 
-## Reconnect: full-jitter exponential backoff
+## Reconnect: built into `Live`
 
-The high-level capture functions ([`stream_to_file`](@ref) and friends)
-re-establish the TCP session on drop. Sleep before each retry is
-`rand() * min(60, 2^(attempt-1))` seconds (AWS-style full-jitter backoff
-capped at 60s), and the loop gives up after `max_reconnect_attempts` (default
-10; pass `nothing` for unlimited).
+Every `Live(...)` client has a reconnect supervisor on by default. When the
+TCP socket drops, the supervisor reopens it, replays your stored
+subscriptions with a per-instrument-min `start=` timestamp (so subscribed
+instruments resume coverage at the earliest point we lost them, bounded
+to a 24h replay window), and continues delivering records into the same
+channels — your `for rec in live` loop sees a continuous stream with no
+exception in between.
 
-If you're driving the Live client yourself outside [`stream_to_file`](@ref),
-you handle reconnects yourself: catch the error from the iterator, construct
-a fresh `Live`, re-`subscribe!`, and resume.
+The retry schedule is *immediate-then-backoff*:
+
+- The first `immediate_reconnect_attempts` retries (default `3`) fire
+  with no sleep, to catch sub-second TCP blips (kernel-side RST plus a
+  packet retransmit or two) without waiting on the 1s+ backoff floor.
+- Subsequent retries use AWS-style full-jitter exponential backoff
+  (`rand() * min(60, 2^(n-1))` seconds, where `n` is the backoff-phase
+  attempt index) up to `max_reconnect_attempts` total (default `10`;
+  pass `nothing` for unlimited).
+- The retry budget refreshes whenever the new reader successfully
+  delivers ≥1 data record, so a long-lived session that streams real
+  data between drops keeps its full budget across the connection's
+  lifetime.
+
+To opt out of the supervisor entirely:
+
+```julia
+Live(dataset = "OPRA.PILLAR", reconnect_policy = :none) do live
+    # Reader's EOF closes the channels and terminates iteration.
+end
+```
+
+### Observing reconnects: [`add_reconnect_callback`](@ref)
+
+Register a callback to be notified on each successful reconnect:
+
+```julia
+Live(dataset = "OPRA.PILLAR") do live
+    add_reconnect_callback(live, (gap_start_ns, gap_end_ns) -> begin
+        @info "reconnect gap" gap_s = (gap_end_ns - gap_start_ns) / 1e9
+        # optional: gap-fill from historical, emit a metric, etc.
+    end)
+    connect!(live)
+    subscribe!(live; schema = Schema.TRADES, symbols = ["SPY.OPT"],
+                     stype_in = SType.PARENT)
+    start!(live)
+    for rec in live
+        # …
+    end
+end
+```
+
+`gap_start_ns` is the latest per-instrument timestamp seen pre-drop
+(minimum across instruments — the earliest point we lost coverage);
+`gap_end_ns` is the gateway's `Metadata.start_ts` from the fresh
+session. Both are `Int64` nanoseconds since the unix epoch. Convert to a
+`DateTime` via `Dates.unix2datetime(ns / 1e9)` (lossy — Julia's
+`DateTime` is millisecond resolution).
+
+Callbacks fire from the supervisor task in registration order; errors
+inside a callback are logged and swallowed (they do not perturb the
+list or fail the reconnect).
+
+### Gateway errors are terminal
+
+If the gateway sends an `ErrorMsg` (auth failed, malformed subscription,
+etc.), the supervisor *does not* reconnect — retrying would just re-hit
+the same condition. The typed reader's control branch sets the
+client's `terminal_error`, channels close, and your iterator exits
+cleanly.
+
+### Convenience: `live_session`
+
+If you don't need to interleave logic between `connect!`, `subscribe!`,
+and `start!`, [`live_session`](@ref) bundles the whole lifecycle into a
+single do-block:
+
+```julia
+live_session(;
+    dataset = "OPRA.PILLAR",
+    subscriptions = [
+        (; schema = Schema.TRADES,  symbols = ["SPY.OPT"], stype_in = SType.PARENT),
+        (; schema = Schema.CBBO_1S, symbols = ["SPY.OPT"], stype_in = SType.PARENT),
+    ],
+) do live
+    for rec in live
+        # …
+    end
+end
+```
+
+`reconnect_policy` defaults to `:reconnect` (same as `Live(...)`).
 
 ## Closing the client
 
-`close(client)` is idempotent. The Live do-block calls it for you on exit; if
-you're managing the lifecycle manually, wrap subscribe/start/iterate in a
-`try/finally close(client) end`. Channels close cleanly, the gateway gets a
-final `stop` frame, and consumer tasks exit on `InvalidStateException` from
-their pending `take!` calls.
+`close(client)` is idempotent. The Live do-block calls it for you on exit;
+if you're managing the lifecycle manually, wrap subscribe/start/iterate in
+a `try/finally close(client) end`. Channels close cleanly, the gateway
+gets a final `stop` frame, the supervisor (if running) observes the
+state transition and exits at its next iteration, and consumer tasks
+exit on `InvalidStateException` from their pending `take!` calls.
