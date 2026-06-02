@@ -26,7 +26,8 @@ julia --project=benchmark benchmark/runbench.jl                 # default tiers 
 julia --project=benchmark benchmark/runbench.jl --profile        # + profiling pass
 julia --project=benchmark benchmark/runbench.jl --tiers=small    # override size tiers
 
-# Docs (Documenter.jl)
+# Docs (Documenter.jl) — first develop the repo package into the docs env, then build
+julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
 julia --project=docs docs/make.jl
 ```
 
