@@ -292,6 +292,10 @@ function open_stream(f, c::HTTPClient, path::AbstractString;
         err_ref      = Ref{Any}(nothing)
         retry_ref    = Ref(false)
         retry_after  = Ref{Union{Nothing,Float64}}(nothing)
+        # Once we hand `io` to `f`, the consumer may have already observed
+        # records, so a mid-body transport error must NOT be retried (that
+        # would replay the partial stream). This flips true just before `f`.
+        consumed     = Ref(false)
 
         try
             c.stream_opener(c, "GET", url, headers, qpairs) do status, hdrs, io
@@ -307,12 +311,14 @@ function open_stream(f, c::HTTPClient, path::AbstractString;
                                                          _request_id_from_headers(hdrs))
                     return nothing
                 end
+                consumed[] = true
                 result_ref[] = f(io)
                 return nothing
             end
         catch e
-            # Transport failure before/while reading the head — safe to retry.
-            if _is_retryable_exception(e) && attempt <= c.max_retries
+            # Retry only transport failures in the pre-body phase (connect +
+            # response head). Once `f` has started reading, surface the error.
+            if _is_retryable_exception(e) && !consumed[] && attempt <= c.max_retries
                 _retry_wait(c, attempt, nothing)
                 continue
             end

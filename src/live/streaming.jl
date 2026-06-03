@@ -896,7 +896,7 @@ function stream_multi_to_files(; schemas::AbstractVector,
             heartbeat_interval = heartbeat_interval,
             slow_reader_behavior = slow_reader_behavior,
             channel_size = channel_size,
-            start_initial = start, snapshot = snapshot,
+            start_initial = start_dt, snapshot = snapshot,
         )
     catch e
         @error "live session crashed" exception=(e, catch_backtrace())
