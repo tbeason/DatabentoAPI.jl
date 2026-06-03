@@ -33,8 +33,8 @@ store = get_range(client;
     dataset  = "XNAS.ITCH",
     schema   = Schema.TRADES,
     symbols  = ["AAPL", "MSFT"],
-    start    = DateTime(2024, 1, 2, 14, 30),
-    end_     = DateTime(2024, 1, 2, 15, 0),
+    start_dt = DateTime(2024, 1, 2, 14, 30),
+    end_dt   = DateTime(2024, 1, 2, 15, 0),
     stype_in = SType.RAW_SYMBOL)
 
 length(store.records)     # Vector{DBN.DBNRecord}
@@ -57,8 +57,8 @@ n_trades = Ref(0)
 foreach_record(client, DBN.TradeMsg;
     dataset = "XNAS.ITCH", schema = Schema.TRADES,
     symbols = ["AAPL"],
-    start   = DateTime(2024, 1, 2, 14, 30),
-    end_    = DateTime(2024, 1, 2, 20, 0)) do trade
+    start_dt = DateTime(2024, 1, 2, 14, 30),
+    end_dt   = DateTime(2024, 1, 2, 20, 0)) do trade
     n_trades[] += 1
 end
 @show n_trades[]
@@ -75,15 +75,15 @@ Before issuing a large `get_range`, preview the query:
 
 ```julia
 get_record_count(client; dataset = "XNAS.ITCH", schema = Schema.TRADES,
-                 symbols = ["AAPL"], start = "2024-01-02", end_ = "2024-01-03")
+                 symbols = ["AAPL"], start_dt = "2024-01-02", end_dt = "2024-01-03")
 # → integer record count
 
 get_billable_size(client; dataset = "XNAS.ITCH", schema = Schema.TRADES,
-                  symbols = ["AAPL"], start = "2024-01-02", end_ = "2024-01-03")
+                  symbols = ["AAPL"], start_dt = "2024-01-02", end_dt = "2024-01-03")
 # → integer billable bytes
 
 get_cost(client; dataset = "XNAS.ITCH", schema = Schema.TRADES,
-         symbols = ["AAPL"], start = "2024-01-02", end_ = "2024-01-03",
+         symbols = ["AAPL"], start_dt = "2024-01-02", end_dt = "2024-01-03",
          mode = FeedMode.HISTORICAL)
 # → USD cost
 ```
@@ -108,7 +108,7 @@ Submit an asynchronous job, poll for completion, then download:
 job = submit_job(client;
     dataset = "XNAS.ITCH", schema = Schema.MBO,
     symbols = ["AAPL"],
-    start = "2024-01-02", end_ = "2024-01-09")
+    start_dt = "2024-01-02", end_dt = "2024-01-09")
 
 job_id = job["id"]
 

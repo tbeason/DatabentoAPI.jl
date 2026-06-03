@@ -24,8 +24,8 @@ function _get_range_call(c)
     store = DatabentoAPI.get_range(c;
         dataset = "TEST.MOCK", schema = Schema.TRADES,
         symbols = ["AAPL"],
-        start = "2024-01-02T14:30:00",
-        end_  = "2024-01-02T14:31:00",
+        start_dt = "2024-01-02T14:30:00",
+        end_dt   = "2024-01-02T14:31:00",
         stype_in = SType.RAW_SYMBOL,
         stype_out = SType.INSTRUMENT_ID,
     )

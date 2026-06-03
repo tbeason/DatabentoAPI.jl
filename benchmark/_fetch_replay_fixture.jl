@@ -98,8 +98,8 @@ function main(args = ARGS)
         schema = Schema.CMBP_1,
         symbols = split(opts["symbols"], ','),
         stype_in = SType.PARENT,
-        start = opts["start"],
-        end_  = opts["end"],
+        start_dt = opts["start"],
+        end_dt   = opts["end"],
         encoding = "dbn", compression = "zstd")
     job_id = String(job["id"])
     println("  job_id  = ", job_id, "   cost_usd = ", job["cost_usd"])

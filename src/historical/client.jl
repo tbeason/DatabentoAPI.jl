@@ -12,8 +12,8 @@ Client for the Databento Historical (HTTP) API.
 ```julia
 client = Historical()
 store  = get_range(client; dataset="XNAS.ITCH", schema=Schema.TRADES,
-                          symbols=["AAPL"], start=DateTime(2024,1,2,14,30),
-                          end_=DateTime(2024,1,2,14,31), stype_in=SType.RAW_SYMBOL)
+                          symbols=["AAPL"], start_dt=DateTime(2024,1,2,14,30),
+                          end_dt=DateTime(2024,1,2,14,31), stype_in=SType.RAW_SYMBOL)
 ```
 """
 struct Historical
@@ -25,13 +25,19 @@ function Historical(key::Union{Nothing,AbstractString} = nothing;
                     timeout::Integer = DEFAULT_TIMEOUT,
                     connect_timeout::Integer = DEFAULT_CONNECT_TIMEOUT,
                     user_agent::AbstractString = USER_AGENT,
-                    dispatcher::Function = _default_http_request)
+                    dispatcher::Function = _default_http_request,
+                    max_retries::Integer = DEFAULT_MAX_RETRIES,
+                    retry_sleep::Function = sleep,
+                    stream_opener::Function = _default_http_stream)
     api_key = load_api_key(key)
     return Historical(HTTPClient(api_key, gateway;
                                  timeout = timeout,
                                  connect_timeout = connect_timeout,
                                  user_agent = user_agent,
-                                 dispatcher = dispatcher))
+                                 dispatcher = dispatcher,
+                                 max_retries = max_retries,
+                                 retry_sleep = retry_sleep,
+                                 stream_opener = stream_opener))
 end
 
 Base.show(io::IO, c::Historical) =

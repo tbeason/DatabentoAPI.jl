@@ -51,7 +51,9 @@ end
 
 Raised when an HTTP request to the Historical API returns a 5xx status
 (gateway timeout, internal error, etc.). Same field layout as
-[`BentoClientError`](@ref); retrying after backoff is usually appropriate.
+[`BentoClientError`](@ref). The client already retries 5xx (and 429) with
+backoff up to its `max_retries` budget, so seeing this means the server kept
+failing across every retry.
 """
 struct BentoServerError <: BentoHttpError
     status::Int

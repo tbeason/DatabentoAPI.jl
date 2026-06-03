@@ -2,7 +2,12 @@ using Test
 using Base64
 using DatabentoAPI
 using DatabentoAPI: HTTPClient, basic_auth_header, _clean_params, request, get_json, post_json
+using DatabentoAPI: _is_retryable_status, _retry_after_seconds, _retry_delay, RETRY_CAP_S,
+                    RETRY_AFTER_CAP_S, DEFAULT_MAX_RETRIES
 using HTTP
+
+# No-op sleep so retry tests don't actually wait on the wall clock.
+const _NOSLEEP = _ -> nothing
 
 @testset "http" begin
     @testset "basic_auth_header" begin
@@ -44,12 +49,101 @@ using HTTP
         @test any(p -> first(p) == "Authorization", captured[].headers)
     end
 
-    @testset "request maps 5xx → BentoServerError" begin
+    @testset "request maps 5xx → BentoServerError (no retry)" begin
         function mock(method, url, headers, body; kwargs...)
             HTTP.Response(503; body = "boom")
         end
-        c = HTTPClient("k", "https://example.test"; dispatcher = mock)
+        c = HTTPClient("k", "https://example.test"; dispatcher = mock, max_retries = 0)
         @test_throws BentoServerError request(c, :POST, "/v0/foo"; body = (a = 1,))
+    end
+
+    @testset "retry helpers" begin
+        @test _is_retryable_status(429)
+        @test _is_retryable_status(500)
+        @test _is_retryable_status(503)
+        @test !_is_retryable_status(501)   # Not Implemented is permanent
+        @test !_is_retryable_status(404)
+        @test !_is_retryable_status(200)
+
+        # Retry-After: integer delta-seconds honored (capped), HTTP-date → nothing.
+        @test _retry_after_seconds(["Retry-After" => "7"]) == 7.0
+        @test _retry_after_seconds(["retry-after" => "2.5"]) == 2.5
+        @test _retry_after_seconds(["Retry-After" => string(RETRY_AFTER_CAP_S + 100)]) == RETRY_AFTER_CAP_S
+        @test _retry_after_seconds(["Retry-After" => "Wed, 21 Oct 2026 07:28:00 GMT"]) === nothing
+        @test _retry_after_seconds(["X-Other" => "5"]) === nothing
+
+        # Backoff stays within the jitter envelope for every attempt.
+        for attempt in 1:8
+            d = _retry_delay(attempt)
+            @test 0.0 <= d <= RETRY_CAP_S
+        end
+    end
+
+    @testset "request retries transient status then succeeds" begin
+        calls = Ref(0)
+        function mock(method, url, headers, body; kwargs...)
+            calls[] += 1
+            calls[] < 3 ? HTTP.Response(503; body = "down") :
+                          HTTP.Response(200; body = """{"ok":true}""")
+        end
+        c = HTTPClient("k", "https://example.test";
+                       dispatcher = mock, retry_sleep = _NOSLEEP)
+        resp = request(c, :GET, "/v0/foo")
+        @test resp.status == 200
+        @test calls[] == 3   # two 503s retried, third call succeeds
+    end
+
+    @testset "request honors Retry-After on 429" begin
+        slept = Float64[]
+        calls = Ref(0)
+        function mock(method, url, headers, body; kwargs...)
+            calls[] += 1
+            calls[] == 1 ? HTTP.Response(429, ["Retry-After" => "4"]; body = "slow down") :
+                           HTTP.Response(200; body = "{}")
+        end
+        c = HTTPClient("k", "https://example.test";
+                       dispatcher = mock, retry_sleep = d -> push!(slept, d))
+        resp = request(c, :GET, "/v0/foo")
+        @test resp.status == 200
+        @test slept == [4.0]   # Retry-After overrode the jittered backoff
+    end
+
+    @testset "request exhausts retry budget then maps the final status" begin
+        calls = Ref(0)
+        function mock(method, url, headers, body; kwargs...)
+            calls[] += 1
+            HTTP.Response(503; body = "still down")
+        end
+        c = HTTPClient("k", "https://example.test";
+                       dispatcher = mock, retry_sleep = _NOSLEEP, max_retries = 2)
+        @test_throws BentoServerError request(c, :GET, "/v0/foo")
+        @test calls[] == 3   # initial attempt + 2 retries
+    end
+
+    @testset "request retries transient transport exception" begin
+        calls = Ref(0)
+        function mock(method, url, headers, body; kwargs...)
+            calls[] += 1
+            calls[] < 2 && throw(HTTP.Exceptions.ConnectError(url, ErrorException("refused")))
+            HTTP.Response(200; body = "{}")
+        end
+        c = HTTPClient("k", "https://example.test";
+                       dispatcher = mock, retry_sleep = _NOSLEEP)
+        resp = request(c, :GET, "/v0/foo")
+        @test resp.status == 200
+        @test calls[] == 2
+    end
+
+    @testset "request does not retry a non-transient exception" begin
+        calls = Ref(0)
+        function mock(method, url, headers, body; kwargs...)
+            calls[] += 1
+            throw(ArgumentError("boom"))
+        end
+        c = HTTPClient("k", "https://example.test";
+                       dispatcher = mock, retry_sleep = _NOSLEEP)
+        @test_throws ArgumentError request(c, :GET, "/v0/foo")
+        @test calls[] == 1   # propagated immediately, not retried
     end
 
     @testset "request returns response on 2xx" begin

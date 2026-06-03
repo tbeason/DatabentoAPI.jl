@@ -42,8 +42,8 @@ using Dates
             dataset  = dataset,
             symbols  = symbols,
             schema   = Schema.TRADES,
-            start    = start_s,
-            end_     = end_s,
+            start_dt = start_s,
+            end_dt   = end_s,
             stype_in = stype_in)
         @info "cost estimate" cost
         @test cost !== nothing
@@ -52,8 +52,8 @@ using Dates
             dataset  = dataset,
             symbols  = symbols,
             schema   = Schema.TRADES,
-            start    = start_s,
-            end_     = end_s,
+            start_dt = start_s,
+            end_dt   = end_s,
             stype_in = stype_in)
         @info "billable size" sz
         @test sz !== nothing
@@ -65,8 +65,8 @@ using Dates
                 dataset  = dataset,
                 schema   = Schema.TRADES,
                 symbols  = symbols,
-                start    = start_s,
-                end_     = end_s,
+                start_dt = start_s,
+                end_dt   = end_s,
                 stype_in = stype_in)
             @test store isa DBNStore
             @test store.metadata.dataset == dataset

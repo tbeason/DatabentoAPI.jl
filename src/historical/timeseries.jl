@@ -1,5 +1,5 @@
 """
-    get_range(client; dataset, schema, symbols, start, end_=nothing,
+    get_range(client; dataset, schema, symbols, start_dt, end_dt=nothing,
               stype_in=SType.RAW_SYMBOL, stype_out=SType.INSTRUMENT_ID,
               limit=nothing, typed=true, size_hint=nothing)
 
@@ -23,8 +23,8 @@ function get_range(c::Historical;
                    dataset::AbstractString,
                    schema::Schema.T,
                    symbols,
-                   start,
-                   end_ = nothing,
+                   start_dt,
+                   end_dt = nothing,
                    stype_in::SType.T  = SType.RAW_SYMBOL,
                    stype_out::SType.T = SType.INSTRUMENT_ID,
                    limit::Union{Nothing,Integer} = nothing,
@@ -36,8 +36,8 @@ function get_range(c::Historical;
         schema      = schema_str(schema),
         stype_in    = stype_str(stype_in),
         stype_out   = stype_str(stype_out),
-        start       = ts_str(start),
-        end_        = ts_str(end_),
+        start       = ts_str(start_dt),
+        end_        = ts_str(end_dt),
         limit       = limit,
         encoding    = "dbn",
         compression = "zstd",
@@ -90,14 +90,16 @@ function record_type_for_schema(schema::Schema.T)
 end
 
 """
-    foreach_record(f, client::Historical; dataset, schema, symbols, start, end_=nothing,
+    foreach_record(f, client::Historical; dataset, schema, symbols, start_dt, end_dt=nothing,
                    stype_in=SType.RAW_SYMBOL, stype_out=SType.INSTRUMENT_ID,
                    limit=nothing, record_type=nothing)
 
 Streaming variant of [`get_range`](@ref). Calls `f(record)` for each `DBN` record as
-it arrives off the wire — overlaps HTTP download with decompress + decode and never
-materialises the compressed payload or the records vector in memory. Use this for
-very large queries where `get_range`'s in-memory buffering would be wasteful.
+it arrives off the wire — interleaves HTTP download with decompress + decode and never
+materialises the compressed payload or the records vector in memory. Records are
+pulled from the socket only as fast as `f` consumes them (backpressure), so a slow
+consumer throttles the download rather than buffering it. Use this for very large
+queries where `get_range`'s in-memory buffering would be wasteful.
 
 By default, the concrete record type is inferred from `schema` (e.g.
 `Schema.TRADES → DBN.TradeMsg`) and the type-specific zero-allocation decode path
@@ -110,8 +112,8 @@ function foreach_record(f, c::Historical;
                         dataset::AbstractString,
                         schema::Schema.T,
                         symbols,
-                        start,
-                        end_ = nothing,
+                        start_dt,
+                        end_dt = nothing,
                         stype_in::SType.T  = SType.RAW_SYMBOL,
                         stype_out::SType.T = SType.INSTRUMENT_ID,
                         limit::Union{Nothing,Integer} = nothing,
@@ -122,8 +124,8 @@ function foreach_record(f, c::Historical;
         schema      = schema_str(schema),
         stype_in    = stype_str(stype_in),
         stype_out   = stype_str(stype_out),
-        start       = ts_str(start),
-        end_        = ts_str(end_),
+        start       = ts_str(start_dt),
+        end_        = ts_str(end_dt),
         limit       = limit,
         encoding    = "dbn",
         compression = "zstd",

@@ -39,9 +39,9 @@ If `get_range` exhausts memory or returns extremely slowly, switch to
 Always preview before issuing a large `get_range`:
 
 ```julia
-get_record_count(client; dataset, schema, symbols, start, end_)
-get_billable_size(client; dataset, schema, symbols, start, end_)
-get_cost(client; dataset, schema, symbols, start, end_, mode = FeedMode.HISTORICAL)
+get_record_count(client; dataset, schema, symbols, start_dt, end_dt)
+get_billable_size(client; dataset, schema, symbols, start_dt, end_dt)
+get_cost(client; dataset, schema, symbols, start_dt, end_dt, mode = FeedMode.HISTORICAL)
 ```
 
 All three are free and run server-side.

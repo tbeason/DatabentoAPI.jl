@@ -65,7 +65,7 @@ list_unit_prices(c::Historical; dataset::AbstractString) =
     get_dataset_range(client; dataset)
 
 Earliest and latest available timestamps for `dataset`. Use the result to
-bound `start`/`end_` on subsequent [`get_range`](@ref) or [`submit_job`](@ref)
+bound `start_dt`/`end_dt` on subsequent [`get_range`](@ref) or [`submit_job`](@ref)
 calls. Wraps `GET /v0/metadata.get_dataset_range`.
 """
 get_dataset_range(c::Historical; dataset::AbstractString) =
@@ -89,7 +89,7 @@ function get_dataset_condition(c::Historical;
 end
 
 """
-    get_record_count(client; dataset, symbols, schema, start, end_=nothing,
+    get_record_count(client; dataset, symbols, schema, start_dt, end_dt=nothing,
                      stype_in=SType.RAW_SYMBOL, limit=nothing)
 
 Count of records the same query would return from [`get_range`](@ref) without
@@ -101,8 +101,8 @@ function get_record_count(c::Historical;
                           dataset::AbstractString,
                           symbols,
                           schema::Schema.T,
-                          start,
-                          end_ = nothing,
+                          start_dt,
+                          end_dt = nothing,
                           stype_in::SType.T = SType.RAW_SYMBOL,
                           limit::Union{Nothing,Integer} = nothing)
     qpairs = _clean_params((
@@ -110,8 +110,8 @@ function get_record_count(c::Historical;
         symbols  = symbols_str(symbols),
         schema   = schema_str(schema),
         stype_in = stype_str(stype_in),
-        start    = ts_str(start),
-        end_     = ts_str(end_),
+        start    = ts_str(start_dt),
+        end_     = ts_str(end_dt),
         limit    = limit,
     ))
     for (i, (k, v)) in enumerate(qpairs)
@@ -121,7 +121,7 @@ function get_record_count(c::Historical;
 end
 
 """
-    get_billable_size(client; dataset, symbols, schema, start, end_=nothing,
+    get_billable_size(client; dataset, symbols, schema, start_dt, end_dt=nothing,
                       stype_in=SType.RAW_SYMBOL, limit=nothing)
 
 Billable size in bytes (uncompressed CSV-equivalent) the same query would
@@ -133,8 +133,8 @@ function get_billable_size(c::Historical;
                            dataset::AbstractString,
                            symbols,
                            schema::Schema.T,
-                           start,
-                           end_ = nothing,
+                           start_dt,
+                           end_dt = nothing,
                            stype_in::SType.T = SType.RAW_SYMBOL,
                            limit::Union{Nothing,Integer} = nothing)
     qpairs = _clean_params((
@@ -142,8 +142,8 @@ function get_billable_size(c::Historical;
         symbols  = symbols_str(symbols),
         schema   = schema_str(schema),
         stype_in = stype_str(stype_in),
-        start    = ts_str(start),
-        end_     = ts_str(end_),
+        start    = ts_str(start_dt),
+        end_     = ts_str(end_dt),
         limit    = limit,
     ))
     for (i, (k, v)) in enumerate(qpairs)
@@ -153,7 +153,7 @@ function get_billable_size(c::Historical;
 end
 
 """
-    get_cost(client; dataset, symbols, schema, start, end_=nothing,
+    get_cost(client; dataset, symbols, schema, start_dt, end_dt=nothing,
              mode=nothing, stype_in=SType.RAW_SYMBOL, limit=nothing)
 
 Dollar cost preview for the same query as [`get_range`](@ref) under the
@@ -165,8 +165,8 @@ function get_cost(c::Historical;
                   dataset::AbstractString,
                   symbols,
                   schema::Schema.T,
-                  start,
-                  end_ = nothing,
+                  start_dt,
+                  end_dt = nothing,
                   mode::Union{Nothing,FeedMode.T,AbstractString} = nothing,
                   stype_in::SType.T = SType.RAW_SYMBOL,
                   limit::Union{Nothing,Integer} = nothing)
@@ -177,8 +177,8 @@ function get_cost(c::Historical;
         symbols  = symbols_str(symbols),
         schema   = schema_str(schema),
         stype_in = stype_str(stype_in),
-        start    = ts_str(start),
-        end_     = ts_str(end_),
+        start    = ts_str(start_dt),
+        end_     = ts_str(end_dt),
         mode     = mode_v,
         limit    = limit,
     ))

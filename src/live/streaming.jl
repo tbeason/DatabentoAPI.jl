@@ -602,7 +602,7 @@ function _run_unified_session(ctxs::Dict{Schema.T,SessionContext};
                 symbols  = symbols,
                 stype_in = stype_in,
                 snapshot = snapshot,
-                start    = start_ts,
+                start_dt = start_ts,
             )
         end
         start!(client)
@@ -774,7 +774,7 @@ function stream_to_file(; schema::Schema.T,
                         slow_reader_behavior = nothing,
                         channel_size::Integer = 10_000,
                         heartbeat_log_interval_s::Real = 30.0,
-                        start = nothing,
+                        start_dt = nothing,
                         snapshot::Bool = false)::String
     base = base_dir === nothing ? joinpath(pwd(), "live") : String(base_dir)
     return open_dbn_writer(
@@ -801,7 +801,7 @@ function stream_to_file(; schema::Schema.T,
                 heartbeat_interval = heartbeat_interval,
                 slow_reader_behavior = slow_reader_behavior,
                 channel_size = channel_size,
-                start_initial = start, snapshot = snapshot,
+                start_initial = start_dt, snapshot = snapshot,
             )
         finally
             monitor_stop[] = true
@@ -857,7 +857,7 @@ function stream_multi_to_files(; schemas::AbstractVector,
                                slow_reader_behavior = nothing,
                                channel_size::Integer = 10_000,
                                heartbeat_log_interval_s::Real = 30.0,
-                               start::Union{Nothing,Dates.DateTime,Integer} = nothing,
+                               start_dt::Union{Nothing,Dates.DateTime,Integer} = nothing,
                                snapshot::Bool = false)::Dict{Schema.T,String}
     isempty(schemas) && throw(ArgumentError("schemas must not be empty"))
     base = base_dir === nothing ? joinpath(pwd(), "live") : String(base_dir)

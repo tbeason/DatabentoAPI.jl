@@ -236,7 +236,7 @@ supervisor (see [`add_reconnect_callback`](@ref)).
 
 `subscriptions` is a vector of NamedTuples describing one subscribe call each.
 Each entry must have `schema` and `symbols`; `stype_in` (default
-`SType.RAW_SYMBOL`), `snapshot` (default `false`), and `start` (default
+`SType.RAW_SYMBOL`), `snapshot` (default `false`), and `start_dt` (default
 `nothing`) are optional.
 
 Any extra `kwargs` are forwarded to `Live(...)` — typically `key`, `gateway`,
@@ -278,7 +278,7 @@ function live_session(fn::Function;
                 symbols  = sub.symbols,
                 stype_in = get(sub, :stype_in, SType.RAW_SYMBOL),
                 snapshot = get(sub, :snapshot, false),
-                start    = get(sub, :start, nothing),
+                start_dt = get(sub, :start_dt, nothing),
             )
         end
         start!(client)

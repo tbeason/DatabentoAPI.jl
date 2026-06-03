@@ -59,7 +59,7 @@ end
         connect!(client)
         @test_throws ArgumentError subscribe!(client;
             schema = Schema.TRADES, symbols = "ES.FUT",
-            snapshot = true, start = 1)
+            snapshot = true, start_dt = 1)
         close(client)
         try wait(mock.accept_task) catch end
     end

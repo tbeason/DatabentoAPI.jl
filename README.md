@@ -43,8 +43,8 @@ store  = get_range(client;
     dataset  = "XNAS.ITCH",
     schema   = Schema.TRADES,
     symbols  = ["AAPL"],
-    start    = DateTime(2024, 1, 2, 14, 30),
-    end_     = DateTime(2024, 1, 2, 14, 31),
+    start_dt = DateTime(2024, 1, 2, 14, 30),
+    end_dt   = DateTime(2024, 1, 2, 14, 31),
     stype_in = SType.RAW_SYMBOL)
 df = to_dataframe(store)
 
@@ -64,7 +64,7 @@ for details.
 
 ## Status
 
-Current version: **0.1.1**. Offline test suite: **1500+ tests**, ~30 s.
+Current version: **0.1.2**. Offline test suite: **1500+ tests**, ~30 s.
 Live-network smoke tests are gated behind `DATABENTO_LIVE_TESTS=1`. See
 [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
