@@ -11,8 +11,8 @@ store = get_range(client;
     dataset  = &quot;XNAS.ITCH&quot;,
     schema   = Schema.TRADES,
     symbols  = [&quot;AAPL&quot;, &quot;MSFT&quot;],
-    start    = DateTime(2024, 1, 2, 14, 30),
-    end_     = DateTime(2024, 1, 2, 15, 0),
+    start_dt = DateTime(2024, 1, 2, 14, 30),
+    end_dt   = DateTime(2024, 1, 2, 15, 0),
     stype_in = SType.RAW_SYMBOL)
 
 length(store.records)     # Vector{DBN.DBNRecord}
@@ -20,25 +20,25 @@ store.metadata.dataset    # &quot;XNAS.ITCH&quot;</code></pre><p><a href="../../
 foreach_record(client, DBN.TradeMsg;
     dataset = &quot;XNAS.ITCH&quot;, schema = Schema.TRADES,
     symbols = [&quot;AAPL&quot;],
-    start   = DateTime(2024, 1, 2, 14, 30),
-    end_    = DateTime(2024, 1, 2, 20, 0)) do trade
+    start_dt = DateTime(2024, 1, 2, 14, 30),
+    end_dt   = DateTime(2024, 1, 2, 20, 0)) do trade
     n_trades[] += 1
 end
 @show n_trades[]</code></pre><p>The first argument after <code>client</code> is the concrete record type for the schema you&#39;ve requested (<code>DBN.TradeMsg</code> for <code>Schema.TRADES</code>, <code>DBN.MBP1Msg</code> for <code>Schema.MBP_1</code>, etc.). DBN.jl&#39;s <code>record_type_for_dbn_schema</code> maps schemas → types.</p><h2 id="Metadata:-cheap,-free,-useful"><a class="docs-heading-anchor" href="#Metadata:-cheap,-free,-useful">Metadata: cheap, free, useful</a><a id="Metadata:-cheap,-free,-useful-1"></a><a class="docs-heading-anchor-permalink" href="#Metadata:-cheap,-free,-useful" title="Permalink"></a></h2><p>Before issuing a large <code>get_range</code>, preview the query:</p><pre><code class="language-julia hljs">get_record_count(client; dataset = &quot;XNAS.ITCH&quot;, schema = Schema.TRADES,
-                 symbols = [&quot;AAPL&quot;], start = &quot;2024-01-02&quot;, end_ = &quot;2024-01-03&quot;)
+                 symbols = [&quot;AAPL&quot;], start_dt = &quot;2024-01-02&quot;, end_dt = &quot;2024-01-03&quot;)
 # → integer record count
 
 get_billable_size(client; dataset = &quot;XNAS.ITCH&quot;, schema = Schema.TRADES,
-                  symbols = [&quot;AAPL&quot;], start = &quot;2024-01-02&quot;, end_ = &quot;2024-01-03&quot;)
+                  symbols = [&quot;AAPL&quot;], start_dt = &quot;2024-01-02&quot;, end_dt = &quot;2024-01-03&quot;)
 # → integer billable bytes
 
 get_cost(client; dataset = &quot;XNAS.ITCH&quot;, schema = Schema.TRADES,
-         symbols = [&quot;AAPL&quot;], start = &quot;2024-01-02&quot;, end_ = &quot;2024-01-03&quot;,
+         symbols = [&quot;AAPL&quot;], start_dt = &quot;2024-01-02&quot;, end_dt = &quot;2024-01-03&quot;,
          mode = FeedMode.HISTORICAL)
 # → USD cost</code></pre><p>Other metadata endpoints — all free — enumerate the catalog:</p><table><tr><th style="text-align: right">Function</th><th style="text-align: right">Use</th></tr><tr><td style="text-align: right"><a href="../../api/historical/#DatabentoAPI.list_publishers"><code>list_publishers</code></a></td><td style="text-align: right">All venues / data providers</td></tr><tr><td style="text-align: right"><a href="../../api/historical/#DatabentoAPI.list_datasets"><code>list_datasets</code></a></td><td style="text-align: right">All datasets, optionally date-windowed</td></tr><tr><td style="text-align: right"><a href="../../api/historical/#DatabentoAPI.list_schemas"><code>list_schemas</code></a></td><td style="text-align: right">Schemas offered by a dataset</td></tr><tr><td style="text-align: right"><a href="../../api/historical/#DatabentoAPI.list_fields"><code>list_fields</code></a></td><td style="text-align: right">Field list for a (schema, encoding)</td></tr><tr><td style="text-align: right"><a href="../../api/historical/#DatabentoAPI.list_unit_prices"><code>list_unit_prices</code></a></td><td style="text-align: right">Price-per-GB by feed mode and schema</td></tr><tr><td style="text-align: right"><a href="../../api/historical/#DatabentoAPI.get_dataset_range"><code>get_dataset_range</code></a></td><td style="text-align: right">First/last available timestamp</td></tr><tr><td style="text-align: right"><a href="../../api/historical/#DatabentoAPI.get_dataset_condition"><code>get_dataset_condition</code></a></td><td style="text-align: right">Per-date data quality status</td></tr></table><h2 id="Batch-jobs:-results-too-big-to-stream"><a class="docs-heading-anchor" href="#Batch-jobs:-results-too-big-to-stream">Batch jobs: results too big to stream</a><a id="Batch-jobs:-results-too-big-to-stream-1"></a><a class="docs-heading-anchor-permalink" href="#Batch-jobs:-results-too-big-to-stream" title="Permalink"></a></h2><p>Submit an asynchronous job, poll for completion, then download:</p><pre><code class="language-julia hljs">job = submit_job(client;
     dataset = &quot;XNAS.ITCH&quot;, schema = Schema.MBO,
     symbols = [&quot;AAPL&quot;],
-    start = &quot;2024-01-02&quot;, end_ = &quot;2024-01-09&quot;)
+    start_dt = &quot;2024-01-02&quot;, end_dt = &quot;2024-01-09&quot;)
 
 job_id = job[&quot;id&quot;]
 
@@ -57,4 +57,4 @@ paths = batch_download(client; job_id = job_id, output_dir = &quot;./batch_out&q
     stype_in   = SType.PARENT,
     stype_out  = SType.INSTRUMENT_ID,
     start_date = Date(2024, 1, 2),
-    end_date   = Date(2024, 1, 5))</code></pre><p>Returns a JSON object whose <code>result</code> field maps each input symbol to a list of <code>(start_date, end_date, mapped_symbol)</code> intervals. Useful for joining historical records to a stable symbol over time.</p></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../authentication/">« Authentication</a><a class="docs-footer-nextpage" href="../live/">Live Streaming »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.17.0 on <span class="colophon-date" title="Wednesday 3 June 2026 16:51">Wednesday 3 June 2026</span>. Using Julia version 1.12.6.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
+    end_date   = Date(2024, 1, 5))</code></pre><p>Returns a JSON object whose <code>result</code> field maps each input symbol to a list of <code>(start_date, end_date, mapped_symbol)</code> intervals. Useful for joining historical records to a stable symbol over time.</p></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../authentication/">« Authentication</a><a class="docs-footer-nextpage" href="../live/">Live Streaming »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.17.0 on <span class="colophon-date" title="Wednesday 3 June 2026 21:44">Wednesday 3 June 2026</span>. Using Julia version 1.12.6.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
