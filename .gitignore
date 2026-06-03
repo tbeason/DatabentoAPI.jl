@@ -21,3 +21,6 @@ config.toml
 # Benchmark artifacts
 benchmark/results/
 benchmark/data/
+
+# Live capture output dirs
+live_capture_*/

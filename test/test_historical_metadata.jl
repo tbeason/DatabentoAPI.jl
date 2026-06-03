@@ -52,8 +52,8 @@ end
             dataset = "XNAS.ITCH",
             symbols = ["AAPL"],
             schema = Schema.MBP_1,
-            start = "2024-01-02T14:30:00",
-            end_  = "2024-01-02T14:31:00")
+            start_dt = "2024-01-02T14:30:00",
+            end_dt   = "2024-01-02T14:31:00")
         @test result["cost"] == 1.23
     end
 end

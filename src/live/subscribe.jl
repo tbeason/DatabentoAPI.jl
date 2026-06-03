@@ -1,6 +1,6 @@
 """
     subscribe!(client; schema, symbols, stype_in=SType.RAW_SYMBOL,
-               snapshot=false, start=nothing) -> Int | Channel{T}
+               snapshot=false, start_dt=nothing) -> Int | Channel{T}
 
 Send a subscription request to the Live gateway. May be called multiple times before
 [`start!`](@ref).
@@ -14,18 +14,18 @@ Return type depends on the client's mode:
   type land together. Subscribing under typed mode to a schema with no
   concrete record type (e.g. `Schema.MIX`) errors.
 
-`snapshot=true` (request an order book snapshot) is mutually exclusive with `start`.
+`snapshot=true` (request an order book snapshot) is mutually exclusive with `start_dt`.
 """
 function subscribe!(c::Live;
                     schema::Schema.T,
                     symbols,
                     stype_in::SType.T = SType.RAW_SYMBOL,
                     snapshot::Bool = false,
-                    start::Union{Nothing,DateTime,Integer} = nothing)
+                    start_dt::Union{Nothing,DateTime,Integer} = nothing)
     c.connected || throw(ArgumentError("call connect!(client) before subscribing"))
     c.started   && throw(ArgumentError("cannot subscribe after start!"))
-    snapshot && start !== nothing &&
-        throw(ArgumentError("snapshot=true and start are mutually exclusive"))
+    snapshot && start_dt !== nothing &&
+        throw(ArgumentError("snapshot=true and start_dt are mutually exclusive"))
 
     # Typed mode requires every subscribed schema to have a concrete record
     # type. Validate up front so the user sees a clear error at subscribe!
@@ -43,9 +43,9 @@ function subscribe!(c::Live;
     c.next_sub_id += 1
 
     syms = symbols_str(symbols)
-    start_ns = start === nothing ? nothing :
-               (start isa Integer ? Int64(start) :
-                Int64(round(Dates.datetime2unix(start) * 1_000_000_000)))
+    start_ns = start_dt === nothing ? nothing :
+               (start_dt isa Integer ? Int64(start_dt) :
+                Int64(round(Dates.datetime2unix(start_dt) * 1_000_000_000)))
 
     write_text_frame(c.socket;
         schema   = schema_str(schema),

@@ -16,8 +16,8 @@ using HTTP
             dataset = "XNAS.ITCH",
             symbols = ["AAPL"],
             schema  = Schema.TRADES,
-            start   = "2024-01-02",
-            end_    = "2024-01-03")
+            start_dt = "2024-01-02",
+            end_dt   = "2024-01-03")
         @test result["id"] == "job-123"
         # Body uses "end" not "end_"
         @test occursin("end=", captured[])

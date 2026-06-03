@@ -66,8 +66,8 @@ end
         dataset = "XNAS.ITCH",
         schema  = Schema.TRADES,
         symbols = ["AAPL"],
-        start   = "2024-01-02T14:30:00",
-        end_    = "2024-01-02T14:31:00",
+        start_dt = "2024-01-02T14:30:00",
+        end_dt   = "2024-01-02T14:31:00",
         stype_in  = SType.RAW_SYMBOL,
         stype_out = SType.INSTRUMENT_ID)
 
@@ -102,8 +102,8 @@ end
         dataset = "XNAS.ITCH",
         schema  = Schema.TRADES,
         symbols = ["AAPL"],
-        start   = "2024-01-02T14:30:00",
-        end_    = "2024-01-02T14:31:00",
+        start_dt = "2024-01-02T14:30:00",
+        end_dt   = "2024-01-02T14:31:00",
         typed   = false,
     )
     @test store isa DBNStore
@@ -124,8 +124,8 @@ end
         dataset = "XNAS.ITCH",
         schema  = Schema.TRADES,
         symbols = ["AAPL"],
-        start   = "2024-01-02T14:30:00",
-        end_    = "2024-01-02T14:31:00",
+        start_dt = "2024-01-02T14:30:00",
+        end_dt   = "2024-01-02T14:31:00",
         size_hint = n,
     )
     @test length(store) == n
@@ -135,8 +135,8 @@ end
         dataset = "XNAS.ITCH",
         schema  = Schema.TRADES,
         symbols = ["AAPL"],
-        start   = "2024-01-02T14:30:00",
-        end_    = "2024-01-02T14:31:00",
+        start_dt = "2024-01-02T14:30:00",
+        end_dt   = "2024-01-02T14:31:00",
         typed = false, size_hint = 999_999,
     )
     @test length(store2) == n
@@ -205,4 +205,75 @@ end
     @test n_g == n
     @test t_t === DBN.TradeMsg
     @test t_g === DBN.TradeMsg
+end
+
+# A stream_opener that replays a fixed sequence of (status, headers, body) tuples,
+# one per reconnect attempt, feeding each body to the consumer as a readable IO.
+# This exercises open_stream/foreach_record end-to-end without a live socket.
+function _seq_opener(responses)
+    i = Ref(0)
+    # `consume` is first to match the do-block opener contract (see _default_http_stream).
+    return (consume, c, method, url, headers, qpairs) -> begin
+        i[] += 1
+        status, hdrs, body = responses[i[]]
+        return consume(status, hdrs, IOBuffer(body))
+    end
+end
+
+const _NOSLEEP_TS = _ -> nothing
+
+@testset "foreach_record streams via injected opener" begin
+    bytes, n = _build_sample_dbn_zstd()
+    opener = _seq_opener([(200, Pair{String,String}[], bytes)])
+    c = Historical("test-key"; gateway = "https://hist.test", stream_opener = opener)
+    seen = Ref(0)
+    md = DatabentoAPI.foreach_record(c;
+        dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+        start_dt = "2024-01-02T14:30:00", end_dt = "2024-01-02T14:31:00") do rec
+        seen[] += 1
+        @test rec isa DBN.TradeMsg
+    end
+    @test seen[] == n
+    @test md isa DBN.Metadata
+    @test md.dataset == "XNAS.ITCH"
+end
+
+@testset "foreach_record retries transient status then streams" begin
+    bytes, n = _build_sample_dbn_zstd()
+    opener = _seq_opener([
+        (503, Pair{String,String}[], Vector{UInt8}("temporarily down")),
+        (200, Pair{String,String}[], bytes),
+    ])
+    c = Historical("test-key"; gateway = "https://hist.test",
+                   stream_opener = opener, retry_sleep = _NOSLEEP_TS)
+    seen = Ref(0)
+    DatabentoAPI.foreach_record(c;
+        dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+        start_dt = "2024-01-02T14:30:00", end_dt = "2024-01-02T14:31:00") do rec
+        seen[] += 1
+    end
+    @test seen[] == n
+end
+
+@testset "foreach_record maps 4xx → BentoClientError" begin
+    body = Vector{UInt8}("""{"detail":{"case":"not_found","message":"nope"}}""")
+    opener = _seq_opener([(404, ["request-id" => "rid-1"], body)])
+    c = Historical("test-key"; gateway = "https://hist.test", stream_opener = opener)
+    @test_throws BentoClientError DatabentoAPI.foreach_record(c;
+        dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+        start_dt = "2024-01-02T14:30:00", end_dt = "2024-01-02T14:31:00") do rec
+    end
+end
+
+@testset "foreach_record propagates a consumer exception" begin
+    bytes, n = _build_sample_dbn_zstd()
+    opener = _seq_opener([(200, Pair{String,String}[], bytes)])
+    c = Historical("test-key"; gateway = "https://hist.test", stream_opener = opener)
+    # An exception from the consumer must propagate (open_stream's do-block tears
+    # the connection down on the way out — verified here via the error path).
+    @test_throws ErrorException DatabentoAPI.foreach_record(c;
+        dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+        start_dt = "2024-01-02T14:30:00", end_dt = "2024-01-02T14:31:00") do rec
+        error("consumer aborted")
+    end
 end

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Automatic HTTP retries on the Historical API.** Transient failures — HTTP
+  `429` (rate limit) and `5xx`, plus connection/timeout errors — are now retried
+  with full-jitter exponential backoff. A `Retry-After` response header, when
+  present, overrides the computed backoff (capped to guard against hostile
+  values). Configurable via the new `max_retries` keyword on `Historical(...)`
+  (default 3); the retry budget, backoff, and sleep hook are all injectable for
+  testing. Once the budget is exhausted the final status is mapped to its
+  `BentoClientError`/`BentoServerError` as before.
+
+### Changed
+- **Breaking: renamed the time-range keyword arguments to `start_dt` / `end_dt`.**
+  The old `start` / `end_` pair was asymmetric (the trailing underscore only
+  existed because `end` is a Julia reserved word). All affected entry points are
+  updated: `get_range`, `foreach_record`, `submit_job`, `get_record_count`,
+  `get_billable_size`, `get_cost`, and the Live `subscribe!` / `live_session`
+  subscription / `stream_to_file` / `stream_multi_to_files` `start` keyword
+  (now `start_dt`). The Databento wire parameters (`start` / `end`) are
+  unchanged. Update call sites from `start = …, end_ = …` to
+  `start_dt = …, end_dt = …`.
+- **`foreach_record` now applies real backpressure.** The streaming download
+  previously drained the connection into an unbounded `Base.BufferStream` on a
+  background task, which could buffer the entire compressed payload in memory and
+  left the producer task running (blocking until server EOF/timeout) when the
+  consumer aborted or finished early. It now reads the response body synchronously
+  on the calling task, so records are pulled from the socket only as fast as the
+  consumer processes them, and the connection is torn down deterministically on
+  every exit path — including an early return or an exception out of the callback.
+
 ## [0.1.2] - 2026-06-01
 
 ### Added

@@ -18,8 +18,8 @@ store  = get_range(client;
     dataset  = "XNAS.ITCH",
     schema   = Schema.TRADES,
     symbols  = ["AAPL"],
-    start    = DateTime(2024, 1, 2, 14, 30),
-    end_     = DateTime(2024, 1, 2, 14, 31),
+    start_dt = DateTime(2024, 1, 2, 14, 30),
+    end_dt   = DateTime(2024, 1, 2, 14, 31),
     stype_in = SType.RAW_SYMBOL)
 df = to_dataframe(store)
 

@@ -1,7 +1,7 @@
 # Batch endpoints — submit asynchronous jobs and download results.
 
 """
-    submit_job(client; dataset, symbols, schema, start, end_=nothing, ...) -> Dict
+    submit_job(client; dataset, symbols, schema, start_dt, end_dt=nothing, ...) -> Dict
 
 Submit an asynchronous batch job. The Historical API queues the request and
 returns a `job_id`; poll [`list_jobs`](@ref) until the [`JobState`](@ref) is
@@ -29,8 +29,8 @@ function submit_job(c::Historical;
                     dataset::AbstractString,
                     symbols,
                     schema::Schema.T,
-                    start,
-                    end_ = nothing,
+                    start_dt,
+                    end_dt = nothing,
                     encoding::Union{Encoding.T,AbstractString} = "dbn",
                     compression::Union{Compression.T,AbstractString} = "zstd",
                     stype_in::SType.T = SType.RAW_SYMBOL,
@@ -54,8 +54,8 @@ function submit_job(c::Historical;
         dataset        = String(dataset),
         symbols        = symbols_str(symbols),
         schema         = schema_str(schema),
-        start          = ts_str(start),
-        end_           = ts_str(end_),
+        start          = ts_str(start_dt),
+        end_           = ts_str(end_dt),
         encoding       = enc_v,
         compression    = cmp_v,
         stype_in       = stype_str(stype_in),
