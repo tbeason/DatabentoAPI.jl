@@ -1,4 +1,4 @@
-const USER_AGENT = "DatabentoAPI.jl/0.1.2"
+const USER_AGENT = "DatabentoAPI.jl/0.1.3"
 const DEFAULT_TIMEOUT = 100
 const DEFAULT_CONNECT_TIMEOUT = 30
 
