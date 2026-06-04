@@ -32,6 +32,103 @@ function Base.read(c::CountingIO, n::Integer)
     bs = read(c.io, n); c.pos += length(bs); bs
 end
 
+# LiveReader — a low-latency IO wrapper for the live TCP socket.
+#
+# `DBN.BufferedReader` is a FILE-throughput optimisation: its refill does a
+# bulk `readbytes!` that BLOCKS accumulating a ~64 KB chunk before any record
+# is surfaced, which on a live socket manifests as "sit, then a burst of
+# records". LiveReader instead refills via `readavailable`, which blocks only
+# until ≥1 byte is present and then hands back everything currently buffered in
+# a single read — so a record is decoded the instant its bytes arrive (low
+# latency) while bursts are still drained in one syscall (throughput). It
+# tracks its own byte offset, subsuming CountingIO. The DBN decoder's IO
+# contract is forward-only (read / skip / eof; no seek or mark), so this is
+# sufficient to drive read_header! and the read_*_msg functions.
+mutable struct LiveReader{T<:IO} <: IO
+    io::T
+    buf::Vector{UInt8}     # unread bytes are buf[pos:len]
+    pos::Int
+    len::Int
+    total::Int64           # bytes consumed so far (for position())
+end
+LiveReader(io::IO) = LiveReader{typeof(io)}(io, UInt8[], 1, 0, Int64(0))
+
+@inline _lr_avail(r::LiveReader) = r.len - r.pos + 1
+
+# Ensure ≥ n unread bytes are buffered, pulling from the socket via
+# `readavailable` (blocks only until data arrives). Compacts the consumed
+# prefix first so the buffer can't grow without bound. Throws EOFError if the
+# stream closes before n bytes are available.
+function _lr_ensure!(r::LiveReader, n::Int)
+    while _lr_avail(r) < n
+        if r.pos > 1
+            a = _lr_avail(r)
+            a > 0 && copyto!(r.buf, 1, r.buf, r.pos, a)
+            resize!(r.buf, a)
+            r.len = a
+            r.pos = 1
+        end
+        chunk = readavailable(r.io)
+        isempty(chunk) && throw(EOFError())
+        append!(r.buf, chunk)
+        r.len = length(r.buf)
+    end
+    return nothing
+end
+
+@inline function _lr_load(r::LiveReader, ::Type{T}) where {T}
+    nb = sizeof(T)
+    _lr_ensure!(r, nb)
+    v = GC.@preserve r unsafe_load(Ptr{T}(pointer(r.buf, r.pos)))
+    r.pos += nb
+    r.total += nb
+    return v
+end
+
+Base.read(r::LiveReader, ::Type{T}) where {T} = _lr_load(r, T)
+# Specialise the primitives DBN reads (mirrors DBN.BufferedReader) so dispatch
+# is unambiguous against Base's own typed-read methods.
+for T in (Int8, UInt8, UInt16, UInt32, UInt64, UInt128,
+          Int16, Int32, Int64, Int128, Float16, Float32, Float64)
+    @eval @inline Base.read(r::LiveReader, ::Type{$T}) = _lr_load(r, $T)
+end
+
+function Base.read(r::LiveReader, n::Integer)
+    nn = Int(n)
+    _lr_ensure!(r, nn)
+    out = r.buf[r.pos:r.pos + nn - 1]
+    r.pos += nn
+    r.total += nn
+    return out
+end
+
+function Base.unsafe_read(r::LiveReader, p::Ptr{UInt8}, n::UInt)
+    nn = Int(n)
+    _lr_ensure!(r, nn)
+    GC.@preserve r unsafe_copyto!(p, pointer(r.buf, r.pos), nn)
+    r.pos += nn
+    r.total += nn
+    return nothing
+end
+
+function Base.skip(r::LiveReader, n::Integer)
+    remaining = Int(n)
+    while remaining > 0
+        _lr_avail(r) == 0 && _lr_ensure!(r, 1)
+        k = min(remaining, _lr_avail(r))
+        r.pos += k
+        r.total += k
+        remaining -= k
+    end
+    return r
+end
+
+Base.eof(r::LiveReader) = _lr_avail(r) > 0 ? false : eof(r.io)
+Base.position(r::LiveReader) = r.total
+Base.bytesavailable(r::LiveReader) = _lr_avail(r) + bytesavailable(r.io)
+Base.isopen(r::LiveReader) = isopen(r.io)
+Base.close(r::LiveReader) = close(r.io)
+
 """
     _reader_loop_typed(c::Live)
 
@@ -81,9 +178,9 @@ function _reader_loop_typed(c::Live)
         raw = c.compression == Compression.ZSTD ?
               TranscodingStream(ZstdDecompressor(), c.socket) :
               c.socket
-        counting = CountingIO(raw)
-        buffered = DBN.BufferedReader(counting)
-        decoder  = DBN.DBNDecoder(buffered)
+        # LiveReader (not DBN.BufferedReader) so records surface the instant
+        # they arrive instead of waiting for a 64 KB chunk to accumulate.
+        decoder  = DBN.DBNDecoder(LiveReader(raw))
         DBN.read_header!(decoder)
         # Capture gateway Metadata.start_ts so the reconnect supervisor has
         # a gap_end timestamp to report to user callbacks.
@@ -199,7 +296,22 @@ function _reader_loop_typed(c::Live)
                     end
                 end
                 if rec !== nothing && ctrl_chan !== nothing && isopen(ctrl_chan)
-                    put!(ctrl_chan, rec)
+                    # Non-blocking put. This reader is the SOLE producer to
+                    # ctrl_chan (reconnect spawns readers sequentially, never
+                    # concurrently), so checking capacity before put! is
+                    # race-free. If the consumer isn't draining control records
+                    # — common, since a parent/continuous subscription floods
+                    # SymbolMappingMsg at start — drop the overflow instead of
+                    # blocking. A blocking put! here would freeze the reader and
+                    # starve EVERY data channel (the bug this guards against).
+                    if Base.n_avail(ctrl_chan) < ctrl_chan.sz_max
+                        put!(ctrl_chan, rec)
+                    else
+                        c.dropped_control += 1
+                        if c.dropped_control == 1
+                            @warn "Live control_channel full; dropping control records (SymbolMappingMsg / SystemMsg / ErrorMsg). Drain control_channel(client), or raise control_channel_size. Further drops are counted in client.dropped_control." dataset = c.dataset
+                        end
+                    end
                 end
                 continue
             end
@@ -288,14 +400,14 @@ end
 function _reader_loop(c::Live)
     try
         # Wrap with zstd decompressor first if the session was negotiated with
-        # `compression=zstd`. Then layer CountingIO (for position tracking) and
-        # BufferedReader (for syscall reduction) before handing to DBN.
+        # `compression=zstd`, then drive the decoder through LiveReader so
+        # records surface as soon as their bytes arrive (low latency) rather
+        # than after a 64 KB buffer fills. LiveReader tracks position itself,
+        # so no separate CountingIO is needed.
         raw = c.compression == Compression.ZSTD ?
               TranscodingStream(ZstdDecompressor(), c.socket) :
               c.socket
-        counting = CountingIO(raw)
-        buffered = DBN.BufferedReader(counting)
-        decoder  = DBN.DBNDecoder(buffered)
+        decoder  = DBN.DBNDecoder(LiveReader(raw))
         DBN.read_header!(decoder)
         # Capture gateway Metadata.start_ts so the reconnect supervisor has
         # a gap_end timestamp to report to user callbacks.

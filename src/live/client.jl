@@ -1,6 +1,7 @@
 """
     Live([key]; dataset, gateway=nothing, port=13000, ts_out=false,
-         heartbeat_interval=nothing, channel_size=10_000, typed=false)
+         heartbeat_interval=nothing, channel_size=10_000,
+         control_channel_size=nothing, typed=false)
 
 Client for the Databento Live (TCP) API.
 
@@ -23,6 +24,17 @@ Typed mode requires every subscribed schema to map to a concrete record
 type (i.e. `DBN.record_type_for_dbn_schema(schema)` returns non-nothing).
 Subscribing to a mixed-record schema like `Schema.MIX` errors at
 `subscribe!`.
+
+The control channel never back-pressures the reader: if it fills (e.g. you
+never drain it while a parent/continuous subscription floods
+`SymbolMappingMsg` at start), the reader **drops** the overflow control
+records rather than blocking — so data delivery is never starved. The drop
+count is tracked in `client.dropped_control` and a one-time warning is
+logged. Drain `control_channel(client)` if you care about those records.
+`control_channel_size` (default `channel_size`) sizes that buffer
+independently; raising it lets you keep more control records before drops
+begin, but it is a buffering knob, not a correctness fix — the non-blocking
+put is what prevents a deadlock.
 
 Default `typed = false` preserves the original single-`Channel{DBN.DBNRecord}`
 behaviour exactly — no migration needed for existing code.
@@ -56,6 +68,12 @@ mutable struct Live
     typed_data_channels::Dict{Schema.T,Any}
     # Typed mode: ErrorMsg / SystemMsg / SymbolMappingMsg flow here.
     control_channel::Union{Nothing,Channel{DBN.DBNRecord}}
+    # Typed mode: count of control records dropped because control_channel
+    # was full. The reader puts control records non-blockingly (see
+    # _reader_loop_typed) so an undrained control_channel can never
+    # back-pressure the reader and starve the data channels. Drain
+    # control_channel(client) to keep this at zero.
+    dropped_control::Int
 
     reader_task::Union{Nothing,Task}
 
@@ -116,6 +134,7 @@ function Live(key::Union{Nothing,AbstractString} = nothing;
               heartbeat_interval::Union{Nothing,Integer} = nothing,
               slow_reader_behavior::Union{Nothing,SlowReaderBehavior.T,AbstractString} = nothing,
               channel_size::Integer = 10_000,
+              control_channel_size::Union{Nothing,Integer} = nothing,
               user_agent::AbstractString = USER_AGENT,
               typed::Bool = false,
               reconnect_policy::Union{ReconnectPolicy.T,Symbol,AbstractString} = ReconnectPolicy.RECONNECT,
@@ -141,9 +160,16 @@ function Live(key::Union{Nothing,AbstractString} = nothing;
 
     # Channels are built per-mode. Typed mode lazily creates per-schema data
     # channels in subscribe!; the control channel is constructed up front so
-    # consumers can reach for it before subscribe! is called.
+    # consumers can reach for it before subscribe! is called. The control
+    # channel can be sized independently of the data channels via
+    # `control_channel_size` (defaults to `channel_size`) — useful to absorb
+    # the burst of SymbolMappingMsg a parent/continuous subscription emits at
+    # start. Sizing only delays a full control channel, though; the reader's
+    # non-blocking control put (see _reader_loop_typed) is what guarantees an
+    # undrained control channel can't stall data delivery.
+    ctrl_size = control_channel_size === nothing ? Int(channel_size) : Int(control_channel_size)
     untyped_channel = typed ? nothing : Channel{DBN.DBNRecord}(Int(channel_size))
-    control_chan    = typed ? Channel{DBN.DBNRecord}(Int(channel_size)) : nothing
+    control_chan    = typed ? Channel{DBN.DBNRecord}(ctrl_size) : nothing
     typed_chans     = Dict{Schema.T,Any}()
 
     return Live(
@@ -154,6 +180,7 @@ function Live(key::Union{Nothing,AbstractString} = nothing;
         nothing,                                 # socket
         typed, Int(channel_size),
         untyped_channel, typed_chans, control_chan,
+        0,                                       # dropped_control
         nothing,                                 # reader_task
         false, false, false,
         nothing, nothing,
