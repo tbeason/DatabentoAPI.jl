@@ -8,13 +8,23 @@ When the schema is type-pure (the common case), `T` is the concrete record
 struct (e.g. `DBN.TradeMsg`) and the records vector is type-stable. For
 mixed-record streams or when `get_range` is called with `typed=false`, `T`
 falls back to the `DBN.DBNRecord` Union.
+
+`failed_ranges` is only populated by chunked `get_range` calls (the `chunk`
+kwarg): each entry is the `(start_dt, end_dt)` of a chunk whose request failed
+after retries, so the caller can re-fetch exactly the missing ranges. It is
+always empty for single-request fetches.
 """
 struct DBNStore{T}
     metadata::DBN.Metadata
     records::Vector{T}
+    failed_ranges::Vector{Tuple{DateTime,DateTime}}
 end
 
-DBNStore(metadata, records::Vector{T}) where {T} = DBNStore{T}(metadata, records)
+# 2-arg forms preserve the pre-failed_ranges construction API.
+DBNStore(metadata, records::Vector{T}) where {T} =
+    DBNStore{T}(metadata, records, Tuple{DateTime,DateTime}[])
+DBNStore{T}(metadata, records::Vector{T}) where {T} =
+    DBNStore{T}(metadata, records, Tuple{DateTime,DateTime}[])
 
 Base.length(s::DBNStore) = length(s.records)
 Base.iterate(s::DBNStore, st...) = iterate(s.records, st...)
@@ -27,7 +37,9 @@ Base.getindex(s::DBNStore, i) = getindex(s.records, i)
 function Base.show(io::IO, s::DBNStore{T}) where {T}
     print(io, "DBNStore{", T, "}(dataset=", s.metadata.dataset,
               ", schema=", s.metadata.schema,
-              ", n=", length(s.records), ")")
+              ", n=", length(s.records))
+    isempty(s.failed_ranges) || print(io, ", failed_chunks=", length(s.failed_ranges))
+    print(io, ")")
 end
 
 # Typed record loop that tolerates interleaved non-schema records.

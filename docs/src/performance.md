@@ -54,6 +54,9 @@ bookkeeping regardless of element type — so the win is in dispatch, not GC.
 
 - **Historical, small query (≤ 1 GB):** [`get_range`](@ref) → [`DBNStore`](@ref)
   → conversion helpers. Easy and ergonomic.
+- **Historical, long range / many fixed-latency requests:** [`get_range`](@ref)
+  with `chunk = Year(1)` (or similar) — chunks fetch concurrently, hiding the
+  ~25–30s per-request server-side assembly latency.
 - **Historical, large query:** [`foreach_record`](@ref) with a typed callback,
   or [`submit_job`](@ref) + [`batch_download`](@ref) and decode the resulting
   files with `DBN.foreach_record` directly.

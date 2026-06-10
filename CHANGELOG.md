@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Chunked + concurrent `get_range`** (#33). New `chunk` kwarg (a
+  `Dates.Period`, e.g. `Year(1)`) splits `[start_dt, end_dt)` into half-open
+  chunks fetched concurrently under a semaphore (`concurrency` kwarg, default
+  8), hiding the ~25–30s fixed per-request server-side assembly latency that
+  made long continuous-symbol pulls take hours sequentially. Records are
+  concatenated in time order; chunks that fail after retries are warned about
+  and recorded in the new `DBNStore.failed_ranges` field for targeted retry
+  (the call throws only if every chunk failed). `chunk` requires an explicit
+  `end_dt` and calendar endpoints, and is incompatible with `limit`.
+  `DBNStore` gained the `failed_ranges` field (always empty outside chunked
+  mode); the 2-argument constructors are unchanged.
 - **`BentoTimeoutError`.** HTTP read timeouts are now mapped to a `BentoError`
   subtype whose message names the remedy (raise `Historical(timeout = ...)` or
   reduce the range) instead of surfacing HTTP.jl's bare
