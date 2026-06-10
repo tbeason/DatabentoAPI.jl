@@ -182,15 +182,20 @@ function _get_range_chunked(c::Historical;
     start = _chunk_datetime(start_dt)
     stop  = _chunk_datetime(end_dt)
     start < stop || throw(ArgumentError("start_dt must be before end_dt"))
-    start + chunk > start || throw(ArgumentError("chunk must be a positive Period"))
 
     # Half-open [t, min(t+chunk, stop)) chunks compose exactly: Databento
     # ranges are themselves [start, end), so no record is duplicated or lost
-    # at the seams and the concatenation needs no dedup.
+    # at the seams and the concatenation needs no dedup. Positivity is checked
+    # at *every* boundary, not just the first: calendar arithmetic means a
+    # period's effective length varies by date, so a single upfront check
+    # cannot rule out a later non-advancing step (which would otherwise append
+    # zero-length chunks forever).
     chunks = Tuple{DateTime,DateTime}[]
     let t = start
         while t < stop
             nxt = min(t + chunk, stop)
+            nxt > t || throw(ArgumentError(
+                "chunk must advance time at every boundary; $chunk does not advance from $t"))
             push!(chunks, (t, nxt))
             t = nxt
         end

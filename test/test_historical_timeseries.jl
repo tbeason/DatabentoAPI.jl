@@ -427,6 +427,12 @@ end
     @test_throws ArgumentError get_range(c; common...,
         start_dt = DateTime(2024, 1, 1), end_dt = DateTime(2024, 1, 3),
         chunk = Day(1), concurrency = 0)
+    @test_throws ArgumentError get_range(c; common...,
+        start_dt = DateTime(2024, 1, 1), end_dt = DateTime(2024, 1, 3),
+        chunk = Day(0))                                            # non-advancing
+    @test_throws ArgumentError get_range(c; common...,
+        start_dt = DateTime(2024, 1, 1), end_dt = DateTime(2024, 1, 3),
+        chunk = Day(-1))                                           # negative
 end
 
 @testset "chunk=nothing keeps single-request behavior (#33)" begin
