@@ -46,6 +46,44 @@ metadata header with a vector of decoded records. Convert it with
 [`to_dataframe`](@ref), [`to_csv`](@ref), [`to_json`](@ref),
 [`to_parquet`](@ref), or write it back to disk with [`to_file`](@ref).
 
+## Chunked, concurrent long-range fetches
+
+Each `get_range` request carries a fixed server-side assembly latency — for
+continuous-symbol queries, ~25–30s regardless of payload size. A multi-year
+pull as one request risks the read timeout; as sequential per-year requests it
+accumulates the fixed latency a hundred times over. Pass `chunk` to split the
+range and fetch chunks concurrently (up to `concurrency`, default 8):
+
+```julia
+store = get_range(client;
+    dataset  = "GLBX.MDP3",
+    schema   = Schema.STATISTICS,
+    symbols  = ["ES.n.0", "ZT.n.0", "ZF.n.0", "ZN.n.0"],
+    stype_in = SType.CONTINUOUS,
+    start_dt = Date(2010, 1, 1),
+    end_dt   = Date(2025, 1, 1),
+    chunk    = Year(1))
+```
+
+Records come back concatenated in time order. Chunks that fail after the
+client's usual retries are warned about and recorded in `store.failed_ranges`
+rather than sinking the whole call (it only throws if every chunk failed), so
+a retry loop is one line per range:
+
+```julia
+for (s, e) in store.failed_ranges
+    retry_store = get_range(client; dataset = "GLBX.MDP3", schema = Schema.STATISTICS,
+                            symbols = ["ES.n.0"], stype_in = SType.CONTINUOUS,
+                            start_dt = s, end_dt = e)
+    append!(store.records, retry_store.records)
+end
+```
+
+`chunk` requires an explicit `end_dt` and calendar endpoints
+(`DateTime`/`Date`/parseable string), and is incompatible with `limit`. For
+multi-GB pulls, [`submit_job`](@ref) → [`batch_download`](@ref) remains the
+better tool.
+
 ## Streaming records: `foreach_record`
 
 For larger queries (millions of records), don't materialize the whole vector.

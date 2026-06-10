@@ -1,5 +1,6 @@
 using Test
 using DatabentoAPI
+using Dates
 using HTTP
 using CodecZstd
 using Logging
@@ -321,6 +322,163 @@ end
         dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
         start_dt = "2024-01-02T14:30:00", end_dt = "2024-01-02T14:31:00") do rec
     end
+end
+
+# ---- chunked + concurrent get_range (#33) ----
+
+# Task-safe mock dispatcher for chunked mode: captures every query under a
+# lock and lets the test key the response (or failure) off the chunk's
+# `start` query param.
+function _chunk_mock(respond)   # respond(start_str) -> HTTP.Response (or throw)
+    lk = ReentrantLock()
+    queries = Vector{Dict{String,String}}()
+    dispatcher = (method, url, headers, body; kwargs...) -> begin
+        q = Dict(get(kwargs, :query, Pair{String,String}[]))
+        lock(lk) do
+            push!(queries, q)
+        end
+        respond(q["start"])
+    end
+    return dispatcher, queries
+end
+
+# Payload whose single trade is tagged (via sequence) so tests can tell which
+# chunk each record came from.
+function _tagged_payload(tag::Integer)
+    _, compressed = _build_dbn_zstd(DBN.DBNRecord[_trade_rec(tag)])
+    return compressed
+end
+
+@testset "chunked get_range splits, fetches, and concatenates in order (#33)" begin
+    # Tag each chunk's record by the day-of-month of the chunk start.
+    dispatcher, queries = _chunk_mock(start_str ->
+        HTTP.Response(200; body = _tagged_payload(Dates.day(DateTime(start_str)))))
+    c = Historical("test-key"; gateway = "https://hist.test", dispatcher = dispatcher)
+    store = get_range(c;
+        dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+        start_dt = DateTime(2024, 1, 1), end_dt = DateTime(2024, 1, 4),
+        chunk = Day(1))
+    @test length(queries) == 3
+    starts = sort([q["start"] for q in queries])
+    @test starts == ["2024-01-01T00:00:00", "2024-01-02T00:00:00", "2024-01-03T00:00:00"]
+    ends = sort([q["end"] for q in queries])
+    @test ends == ["2024-01-02T00:00:00", "2024-01-03T00:00:00", "2024-01-04T00:00:00"]
+    # Records concatenated in chunk (= time) order regardless of completion order.
+    @test store isa DBNStore{DBN.TradeMsg}
+    @test [Int(r.sequence) for r in store] == [1, 2, 3]
+    @test isempty(store.failed_ranges)
+
+    # Ragged final chunk is clamped to end_dt.
+    dispatcher2, queries2 = _chunk_mock(start_str ->
+        HTTP.Response(200; body = _tagged_payload(1)))
+    c2 = Historical("test-key"; gateway = "https://hist.test", dispatcher = dispatcher2)
+    get_range(c2;
+        dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+        start_dt = DateTime(2024, 1, 1), end_dt = DateTime(2024, 1, 3, 12),
+        chunk = Day(1))
+    @test length(queries2) == 3
+    @test maximum(q["end"] for q in queries2) == "2024-01-03T12:00:00"
+end
+
+@testset "chunked get_range warns and records failed chunks (#33)" begin
+    # Middle chunk (Jan 2) 404s; the others succeed.
+    dispatcher, _ = _chunk_mock(start_str ->
+        startswith(start_str, "2024-01-02") ?
+            HTTP.Response(404; body = """{"detail":{"case":"not_found","message":"nope"}}""") :
+            HTTP.Response(200; body = _tagged_payload(Dates.day(DateTime(start_str)))))
+    c = Historical("test-key"; gateway = "https://hist.test",
+                   dispatcher = dispatcher, max_retries = 0)
+    store = @test_logs (:warn, r"chunk failed") (:warn, r"1 of 3 chunks failed") get_range(c;
+        dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+        start_dt = DateTime(2024, 1, 1), end_dt = DateTime(2024, 1, 4),
+        chunk = Day(1))
+    @test [Int(r.sequence) for r in store] == [1, 3]
+    @test store.failed_ranges == [(DateTime(2024, 1, 2), DateTime(2024, 1, 3))]
+end
+
+@testset "chunked get_range throws when every chunk fails (#33)" begin
+    dispatcher, _ = _chunk_mock(_ ->
+        HTTP.Response(404; body = """{"detail":{"case":"not_found","message":"nope"}}"""))
+    c = Historical("test-key"; gateway = "https://hist.test",
+                   dispatcher = dispatcher, max_retries = 0)
+    @test_logs (:warn, r"chunk failed") (:warn, r"chunk failed") match_mode=:any begin
+        @test_throws BentoClientError get_range(c;
+            dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+            start_dt = DateTime(2024, 1, 1), end_dt = DateTime(2024, 1, 3),
+            chunk = Day(1))
+    end
+end
+
+@testset "chunked get_range validation (#33)" begin
+    c = Historical("test-key"; gateway = "https://hist.test",
+                   dispatcher = (args...; kw...) -> error("must not dispatch"))
+    common = (dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"])
+    @test_throws ArgumentError get_range(c; common...,
+        start_dt = DateTime(2024, 1, 1), end_dt = DateTime(2024, 1, 3),
+        chunk = Day(1), limit = 100)
+    @test_throws ArgumentError get_range(c; common...,
+        start_dt = DateTime(2024, 1, 1), chunk = Day(1))           # no end_dt
+    @test_throws ArgumentError get_range(c; common...,
+        start_dt = 1_700_000_000_000_000_000, end_dt = DateTime(2024, 1, 3),
+        chunk = Day(1))                                            # unix-ns int
+    @test_throws ArgumentError get_range(c; common...,
+        start_dt = DateTime(2024, 1, 3), end_dt = DateTime(2024, 1, 1),
+        chunk = Day(1))                                            # start ≥ end
+    @test_throws ArgumentError get_range(c; common...,
+        start_dt = DateTime(2024, 1, 1), end_dt = DateTime(2024, 1, 3),
+        chunk = Day(1), concurrency = 0)
+    @test_throws ArgumentError get_range(c; common...,
+        start_dt = DateTime(2024, 1, 1), end_dt = DateTime(2024, 1, 3),
+        chunk = Day(0))                                            # non-advancing
+    @test_throws ArgumentError get_range(c; common...,
+        start_dt = DateTime(2024, 1, 1), end_dt = DateTime(2024, 1, 3),
+        chunk = Day(-1))                                           # negative
+end
+
+@testset "chunk=nothing keeps single-request behavior (#33)" begin
+    bytes, n = _build_sample_dbn_zstd()
+    calls = Ref(0)
+    mock = (method, url, headers, body; kwargs...) -> begin
+        calls[] += 1
+        HTTP.Response(200; body = bytes)
+    end
+    c = Historical("test-key"; gateway = "https://hist.test", dispatcher = mock)
+    store = get_range(c;
+        dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+        start_dt = "2024-01-02T14:30:00", end_dt = "2024-01-02T14:31:00")
+    @test calls[] == 1
+    @test length(store) == n
+    @test isempty(store.failed_ranges)
+    # 2-arg constructors (pre-failed_ranges API) still work.
+    s2 = DBNStore(store.metadata, store.records)
+    @test s2 isa DBNStore{DBN.TradeMsg} && isempty(s2.failed_ranges)
+    s3 = DBNStore{DBN.TradeMsg}(store.metadata, store.records)
+    @test isempty(s3.failed_ranges)
+end
+
+@testset "chunked get_range respects the concurrency gate (#33)" begin
+    in_flight = Threads.Atomic{Int}(0)
+    max_seen = Threads.Atomic{Int}(0)
+    payload = _tagged_payload(1)
+    dispatcher = (method, url, headers, body; kwargs...) -> begin
+        cur = Threads.atomic_add!(in_flight, 1) + 1
+        # Record the high-water mark of simultaneous in-flight requests.
+        old = max_seen[]
+        while cur > old
+            Threads.atomic_cas!(max_seen, old, cur) == old && break
+            old = max_seen[]
+        end
+        sleep(0.05)   # hold the slot long enough for overlap to be observable
+        Threads.atomic_sub!(in_flight, 1)
+        HTTP.Response(200; body = payload)
+    end
+    c = Historical("test-key"; gateway = "https://hist.test", dispatcher = dispatcher)
+    store = get_range(c;
+        dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+        start_dt = DateTime(2024, 1, 1), end_dt = DateTime(2024, 1, 5),
+        chunk = Day(1), concurrency = 2)
+    @test length(store) == 4
+    @test max_seen[] <= 2
 end
 
 @testset "typed get_range tolerates interleaved control records (#30)" begin
