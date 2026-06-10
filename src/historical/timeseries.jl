@@ -18,6 +18,13 @@ return for callers that rely on the Union element type.
 `get_record_count` call) pre-size the records vector exactly. The default
 heuristic over-allocates by 10–20% to avoid realloc churn under growth; an
 exact hint avoids that waste.
+
+!!! note "Long ranges and the read timeout"
+    The gateway can spend minutes on server-side assembly (continuous-symbol
+    resolution, day-partitioned scans) before streaming the first byte. If
+    that exceeds the client's read timeout (default 600s) the call raises
+    [`BentoTimeoutError`](@ref) — construct `Historical(timeout = ...)` with a
+    larger budget or reduce the range.
 """
 function get_range(c::Historical;
                    dataset::AbstractString,

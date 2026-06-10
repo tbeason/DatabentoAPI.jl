@@ -64,6 +64,29 @@ struct BentoServerError <: BentoHttpError
     body::String
 end
 
+"""
+    BentoTimeoutError(timeout_s) <: BentoError
+
+Raised when the gateway produces no response bytes for `timeout_s` seconds and
+the client gives up (HTTP read/inactivity timeout). Long-range
+`timeseries.get_range` queries — e.g. multi-year continuous-symbol pulls — can
+spend minutes in server-side assembly before the first byte arrives, so this
+usually means the request needs a larger client timeout, not that the server
+failed. Construct the client with a bigger budget (`Historical(timeout = ...)`)
+or reduce the requested range.
+
+Read timeouts are **not** retried: for a given query shape the server-side
+assembly time is deterministic, so a retry would burn the same timeout again.
+"""
+struct BentoTimeoutError <: BentoError
+    timeout_s::Int
+end
+
+Base.showerror(io::IO, e::BentoTimeoutError) =
+    print(io, "BentoTimeoutError: response exceeded client read timeout of ",
+          e.timeout_s, "s; construct Historical(timeout = ...) with a larger ",
+          "value or reduce the requested range")
+
 function _parse_http_error_body(body::AbstractString)
     case = ""
     message = String(body)

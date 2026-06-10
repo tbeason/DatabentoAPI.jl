@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`BentoTimeoutError`.** HTTP read timeouts are now mapped to a `BentoError`
+  subtype whose message names the remedy (raise `Historical(timeout = ...)` or
+  reduce the range) instead of surfacing HTTP.jl's bare
+  `TimeoutError: Connection closed after N seconds` (#31).
+
+### Changed
+- **Default HTTP read timeout raised from 100s to 600s.** Long-range
+  `get_range` queries (e.g. multi-year continuous-symbol pulls) can spend well
+  over 100s in server-side assembly before the first byte streams, so every
+  such request used to die on the client's own timeout (#31). Note the
+  timeout is inactivity-based, so a genuinely hung connection now takes up to
+  10 minutes to surface.
+- **Read timeouts are no longer retried.** Server-side assembly time is
+  deterministic for a given query shape, so retrying a timed-out request burns
+  the same timeout again with zero success probability. Connect errors and
+  transient statuses (429/5xx) are retried as before (#31).
+
 ### Fixed
 - **Docs: corrected the `foreach_record` example in the Historical guide.** It
   showed a nonexistent positional record-type method

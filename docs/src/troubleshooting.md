@@ -28,6 +28,21 @@ support.
 
 ## Historical
 
+### `BentoTimeoutError` on long-range `get_range`
+
+The gateway can spend minutes on server-side assembly (continuous-symbol
+resolution, day-partitioned scans) before streaming the first byte — for
+multi-year pulls this can exceed the client's read timeout (default 600s).
+The fix is a bigger client budget:
+
+```julia
+client = Historical(timeout = 1800)   # seconds of read inactivity tolerated
+```
+
+or a smaller range per request. Read timeouts are not retried: the assembly
+time is deterministic for a given query shape, so a retry would burn the same
+timeout again.
+
 ### Query too large to materialize
 
 If `get_range` exhausts memory or returns extremely slowly, switch to

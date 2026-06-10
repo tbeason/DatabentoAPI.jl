@@ -85,7 +85,8 @@ export SplitDuration, Packaging, Delivery, SymbologyResolution, RollRule
 export SlowReaderBehavior
 
 # Errors
-export BentoError, BentoAuthError, BentoHttpError, BentoClientError, BentoServerError
+export BentoError, BentoAuthError, BentoHttpError, BentoClientError, BentoServerError,
+       BentoTimeoutError
 
 # Auth
 export load_api_key, default_config_path
