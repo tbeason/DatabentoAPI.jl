@@ -310,6 +310,11 @@ function open_stream(f, c::HTTPClient, path::AbstractString;
         # records, so a mid-body transport error must NOT be retried (that
         # would replay the partial stream). This flips true just before `f`.
         consumed     = Ref(false)
+        # The exact exception object that escaped `f`, if any. Needed to
+        # distinguish "our stream timed out" from "the consumer's own code
+        # threw an HTTP TimeoutError" (e.g. `f` makes its own HTTP request):
+        # only the former should be mapped to BentoTimeoutError below.
+        f_err        = Ref{Any}(nothing)
 
         try
             c.stream_opener(c, "GET", url, headers, qpairs) do status, hdrs, io
@@ -326,7 +331,12 @@ function open_stream(f, c::HTTPClient, path::AbstractString;
                     return nothing
                 end
                 consumed[] = true
-                result_ref[] = f(io)
+                result_ref[] = try
+                    f(io)
+                catch fe
+                    f_err[] = fe
+                    rethrow()
+                end
                 return nothing
             end
         catch e
@@ -338,8 +348,14 @@ function open_stream(f, c::HTTPClient, path::AbstractString;
             end
             # Read timeout → BentoTimeoutError whether or not `f` started: a
             # mid-body stall deserves the same actionable message as a
-            # pre-first-byte one.
-            e isa HTTP.Exceptions.TimeoutError && throw(BentoTimeoutError(c.timeout))
+            # pre-first-byte one. (When our stream stalls mid-body, HTTP.jl's
+            # timeout layer closes the connection — `f`'s read fails with an
+            # IO error, and the TimeoutError is raised by the HTTP.open frame
+            # itself, so it is a *different* object than f_err[]. An identical
+            # object means the consumer's own code threw it: propagate that
+            # untouched rather than blaming the Databento stream.)
+            e isa HTTP.Exceptions.TimeoutError && e !== f_err[] &&
+                throw(BentoTimeoutError(c.timeout))
             rethrow()
         end
 
