@@ -30,6 +30,72 @@ function Base.show(io::IO, s::DBNStore{T}) where {T}
               ", n=", length(s.records), ")")
 end
 
+# Typed record loop that tolerates interleaved non-schema records.
+#
+# Historical responses are *mostly* type-pure, but the gateway can legitimately
+# interleave control records — ErrorMsg (e.g. partial continuous-symbol
+# resolution), SystemMsg, SymbolMappingMsg — with the data (#30). DBN's
+# `_foreach_record_impl` throws on the first rtype mismatch, which forced
+# callers back to `typed=false` (10× slower) and silently discarded the
+# ErrorMsg text explaining *why* data was missing. This loop keeps the
+# zero-allocation typed hot path (peek header → read straight into a reused
+# Ref{T} buffer) and handles everything else by category:
+#
+#   - ErrorMsg            → per-record @warn (rare, and the content is the
+#                           whole point: it explains gaps in the response)
+#   - SystemMsg / SymbolMappingMsg → decode + @debug (routine noise)
+#   - other known rtypes  → skip by header length, count, one summary @warn
+#   - unknown raw rtypes  → skip by header length, count, one summary @warn
+#
+# Mismatched data records get a single post-loop summary, never a per-record
+# warn — a wrong `record_type` override against a million-record stream must
+# not emit a million log lines. The summary (rather than silence) matters for
+# data-loss visibility: a skipped data rtype means the caller's type and the
+# stream disagree.
+#
+# Unlike DBN's loop, there is deliberately no `finally` that closes
+# `decoder.io` — our decoders wrap HTTP bodies / TranscodingStreams whose
+# lifecycle is owned by `open_stream` / the caller, not by this function.
+function _foreach_typed_tolerant(f, decoder::DBN.DBNDecoder, ::Type{T}) where {T}
+    expected = DBN._type_to_rtype_stream(T)
+    buffer = Ref{T}()   # reused per record: the typed read is allocation-free
+    skipped = 0
+    while !eof(decoder.io)
+        hd_result = DBN.read_record_header(decoder.io)
+        # Unknown raw rtype byte: read_record_header returns a tuple after
+        # consuming only the 2 (length, rtype) bytes; length is in 4-byte units.
+        if hd_result isa Tuple
+            _, _, len_units = hd_result
+            skip(decoder.io, Int(len_units) * DBN.LENGTH_MULTIPLIER - 2)
+            skipped += 1
+            continue
+        end
+        hd = hd_result
+        rt = hd.rtype
+        if rt == expected ||
+           (T === DBN.OHLCVMsg && (rt == DBN.RType.OHLCV_1S_MSG || rt == DBN.RType.OHLCV_1M_MSG ||
+                                   rt == DBN.RType.OHLCV_1H_MSG || rt == DBN.RType.OHLCV_1D_MSG))
+            buffer[] = DBN._read_typed_record_stream(decoder, T, hd)
+            f(buffer[])
+        elseif rt == DBN.RType.ERROR_MSG
+            rec = DBN.read_error_msg(decoder, hd)
+            @warn "Databento gateway error record interleaved in response stream" err = rec.err
+        elseif rt == DBN.RType.SYSTEM_MSG || rt == DBN.RType.SYMBOL_MAPPING_MSG
+            rec = DBN.read_record_dispatch(decoder, hd, rt)
+            @debug "Skipping control record in typed decode" rtype = rt
+        else
+            # Known data rtype that doesn't match the schema's record type.
+            # The full 16-byte header is already consumed; hd.length is in
+            # 4-byte units and covers the whole record.
+            skip(decoder.io, Int(hd.length) * DBN.LENGTH_MULTIPLIER - 16)
+            skipped += 1
+        end
+    end
+    skipped > 0 &&
+        @warn "Typed decode skipped records whose rtype did not match the schema's record type" expected_type = T skipped
+    return nothing
+end
+
 """
     decode_dbn_stream(io) -> DBNStore{DBN.DBNRecord}
     decode_dbn_stream(io, ::Type{T}) -> DBNStore{T}
@@ -42,6 +108,11 @@ The single-argument form decodes generically into a `Vector{DBN.DBNRecord}`
 (slow GC-bound path). The two-argument form decodes directly into a
 `Vector{T}` via DBN.jl's type-specific reader, which is ~10× faster and
 has near-zero per-record allocation.
+
+The typed form tolerates interleaved non-`T` records instead of throwing:
+gateway `ErrorMsg` records are logged with `@warn` (their text explains why
+data is missing), `SystemMsg`/`SymbolMappingMsg` are skipped quietly, and any
+other mismatched or unknown rtypes are skipped with a single summary warning.
 """
 function decode_dbn_stream(io::IO)::DBNStore{DBN.DBNRecord}
     decoder = DBN.DBNDecoder(io)
@@ -68,7 +139,7 @@ function decode_dbn_stream(io::IO, ::Type{T};
     elseif md_limit !== nothing && md_limit > 0
         sizehint!(records, Int(md_limit))
     end
-    DBN._foreach_record_impl(decoder, T) do rec
+    _foreach_typed_tolerant(decoder, T) do rec
         push!(records, rec)
     end
     return DBNStore(decoder.metadata, records)

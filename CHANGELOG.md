@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transient statuses (429/5xx) are retried as before (#31).
 
 ### Fixed
+- **Typed `get_range`/`foreach_record` no longer throw on interleaved
+  non-schema records** (#30). Historical responses can legitimately carry
+  gateway `ErrorMsg` (e.g. partial continuous-symbol resolution), `SystemMsg`,
+  and `SymbolMappingMsg` records among the data; the typed decode path used to
+  die on the first one (`Expected ... but got rtype=ERROR_MSG`), forcing
+  `typed=false`. Now `ErrorMsg` records are surfaced via `@warn` (they explain
+  why data is missing), `SystemMsg`/`SymbolMappingMsg` are skipped quietly,
+  and any other mismatched or unknown record types are skipped with a single
+  summary warning. Behavior note: an explicitly wrong `record_type` override
+  on `foreach_record` now yields zero callbacks plus the summary warning
+  instead of throwing.
 - **Docs: corrected the `foreach_record` example in the Historical guide.** It
   showed a nonexistent positional record-type method
   (`foreach_record(client, DBN.TradeMsg; ...)`), which raises a `MethodError`.
