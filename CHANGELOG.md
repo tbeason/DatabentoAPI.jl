@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Docs: corrected the `foreach_record` example in the Historical guide.** It
+  showed a nonexistent positional record-type method
+  (`foreach_record(client, DBN.TradeMsg; ...)`), which raises a `MethodError`.
+  The record type is inferred from `schema` and overridable via the
+  `record_type` keyword (#32).
+
 ## [0.2.0] - 2026-06-04
 
 ### Added

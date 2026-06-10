@@ -54,7 +54,7 @@ the hot path allocation-free:
 
 ```julia
 n_trades = Ref(0)
-foreach_record(client, DBN.TradeMsg;
+foreach_record(client;
     dataset = "XNAS.ITCH", schema = Schema.TRADES,
     symbols = ["AAPL"],
     start_dt = DateTime(2024, 1, 2, 14, 30),
@@ -64,10 +64,20 @@ end
 @show n_trades[]
 ```
 
-The first argument after `client` is the concrete record type for the
-schema you've requested (`DBN.TradeMsg` for `Schema.TRADES`,
-`DBN.MBP1Msg` for `Schema.MBP_1`, etc.). DBN.jl's `record_type_for_dbn_schema`
-maps schemas → types.
+The concrete record type is inferred from `schema` (`DBN.TradeMsg` for
+`Schema.TRADES`, `DBN.MBP1Msg` for `Schema.MBP_1`, etc.), so the callback
+receives concrete records on the allocation-free typed path by default. To
+name the record types yourself — e.g. to override the inferred type — bring
+the conventional `DBN` alias into scope first:
+
+```julia
+import DatabentoBinaryEncoding as DBN
+
+foreach_record(client; record_type = DBN.DBNRecord, ...)  # generic Union path
+foreach_record(client; record_type = DBN.TradeMsg,  ...)  # explicit override
+```
+
+The function returns the response's `DBN.Metadata`.
 
 ## Metadata: cheap, free, useful
 
