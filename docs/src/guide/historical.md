@@ -66,10 +66,18 @@ end
 
 The concrete record type is inferred from `schema` (`DBN.TradeMsg` for
 `Schema.TRADES`, `DBN.MBP1Msg` for `Schema.MBP_1`, etc.), so the callback
-receives concrete records on the allocation-free typed path by default. Pass
-`record_type = DBN.DBNRecord` to force the generic Union-typed path, or
-`record_type = SomeT` to override the inferred type. The function returns the
-response's `DBN.Metadata`.
+receives concrete records on the allocation-free typed path by default. To
+name the record types yourself — e.g. to override the inferred type — bring
+the conventional `DBN` alias into scope first:
+
+```julia
+import DatabentoBinaryEncoding as DBN
+
+foreach_record(client; record_type = DBN.DBNRecord, ...)  # generic Union path
+foreach_record(client; record_type = DBN.TradeMsg,  ...)  # explicit override
+```
+
+The function returns the response's `DBN.Metadata`.
 
 ## Metadata: cheap, free, useful
 
