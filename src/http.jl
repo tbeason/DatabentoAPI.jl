@@ -1,5 +1,9 @@
 const USER_AGENT = "DatabentoAPI.jl/0.2.0"
-const DEFAULT_TIMEOUT = 100
+# Read (inactivity) timeout. Long-range `timeseries.get_range` queries can
+# spend minutes in server-side assembly (continuous-symbol resolution +
+# day-partitioned scans) before the first byte streams, so this needs to be
+# generous — 100s provably kills multi-year pulls (#31).
+const DEFAULT_TIMEOUT = 600
 const DEFAULT_CONNECT_TIMEOUT = 30
 
 # Retry policy. Transient failures (HTTP 429 / 5xx and connection/timeout
@@ -73,9 +77,15 @@ HTTPClient(api_key::AbstractString, base_url::AbstractString;
 # 501 Not Implemented (a permanent "this server can't do that").
 _is_retryable_status(status::Integer) = status == 429 || (500 <= status < 600 && status != 501)
 
-# Transient transport-layer failures from HTTP.jl (connect/timeout/request
-# errors). Status errors don't appear here because we pass status_exception=false.
-_is_retryable_exception(e) = e isa HTTP.Exceptions.HTTPError
+# Transient transport-layer failures from HTTP.jl (connect/request errors).
+# Status errors don't appear here because we pass status_exception=false.
+# Read timeouts are excluded: for long-range queries the server-side assembly
+# time is deterministic, so a request that exceeded the read timeout once will
+# exceed it on every retry — retrying just multiplies the wall-clock cost by
+# (1 + max_retries) with zero success probability. Connect timeouts surface as
+# the distinct `HTTP.ConnectError` and remain retryable.
+_is_retryable_exception(e) =
+    e isa HTTP.Exceptions.HTTPError && !(e isa HTTP.Exceptions.TimeoutError)
 
 # Parse a `Retry-After` header. The delta-seconds form is honored (capped);
 # the rarer HTTP-date form falls back to `nothing` so the caller uses backoff.
@@ -191,6 +201,10 @@ function request(c::HTTPClient, method::Symbol, path::AbstractString;
                 _retry_wait(c, attempt, nothing)
                 continue
             end
+            # Read timeout: not retryable (see _is_retryable_exception). Map to
+            # a BentoError naming the actual remedy — HTTP.jl's raw TimeoutError
+            # gives no hint that it's the *client* giving up.
+            e isa HTTP.Exceptions.TimeoutError && throw(BentoTimeoutError(c.timeout))
             rethrow()
         end
 
@@ -322,6 +336,10 @@ function open_stream(f, c::HTTPClient, path::AbstractString;
                 _retry_wait(c, attempt, nothing)
                 continue
             end
+            # Read timeout → BentoTimeoutError whether or not `f` started: a
+            # mid-body stall deserves the same actionable message as a
+            # pre-first-byte one.
+            e isa HTTP.Exceptions.TimeoutError && throw(BentoTimeoutError(c.timeout))
             rethrow()
         end
 

@@ -10,4 +10,5 @@ BentoAuthError
 BentoHttpError
 BentoClientError
 BentoServerError
+BentoTimeoutError
 ```

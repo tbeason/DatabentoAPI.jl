@@ -2,12 +2,19 @@ const DEFAULT_HIST_GATEWAY = "https://hist.databento.com"
 const HIST_API_VERSION = "v0"
 
 """
-    Historical([key]; gateway=DEFAULT_HIST_GATEWAY, timeout=100, user_agent=...)
+    Historical([key]; gateway=DEFAULT_HIST_GATEWAY, timeout=600, user_agent=...)
 
 Client for the Databento Historical (HTTP) API.
 
 `key` falls back to `~/.databento/config.toml` then `ENV["DATABENTO_API_KEY"]` (see
 [`load_api_key`](@ref)).
+
+`timeout` is the HTTP read (inactivity) timeout in seconds — how long the
+client waits without receiving any response bytes before giving up with a
+[`BentoTimeoutError`](@ref). Long-range `get_range` queries (e.g. multi-year
+continuous-symbol pulls) can spend minutes in server-side assembly before the
+first byte streams, so set this generously for such workloads; read timeouts
+are deterministic for a given query shape and are therefore not retried.
 
 ```julia
 client = Historical()

@@ -3,7 +3,7 @@ using Base64
 using DatabentoAPI
 using DatabentoAPI: HTTPClient, basic_auth_header, _clean_params, request, get_json, post_json
 using DatabentoAPI: _is_retryable_status, _retry_after_seconds, _retry_delay, RETRY_CAP_S,
-                    RETRY_AFTER_CAP_S, DEFAULT_MAX_RETRIES
+                    RETRY_AFTER_CAP_S, DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT
 using HTTP
 
 # No-op sleep so retry tests don't actually wait on the wall clock.
@@ -132,6 +132,48 @@ const _NOSLEEP = _ -> nothing
         resp = request(c, :GET, "/v0/foo")
         @test resp.status == 200
         @test calls[] == 2
+    end
+
+    @testset "read timeout → BentoTimeoutError, no retry" begin
+        calls = Ref(0)
+        function mock(method, url, headers, body; kwargs...)
+            calls[] += 1
+            throw(HTTP.Exceptions.TimeoutError(100))
+        end
+        c = HTTPClient("k", "https://example.test";
+                       dispatcher = mock, retry_sleep = _NOSLEEP, timeout = 100)
+        @test_throws BentoTimeoutError request(c, :GET, "/v0/foo")
+        @test calls[] == 1   # deterministic failure: no retry budget burned
+
+        # The mapped error carries the configured timeout and an actionable hint.
+        err = try
+            request(c, :GET, "/v0/foo")
+        catch e
+            e
+        end
+        @test err isa BentoTimeoutError
+        @test err.timeout_s == 100
+        msg = sprint(showerror, err)
+        @test occursin("100s", msg)
+        @test occursin("Historical(timeout = ...)", msg)
+    end
+
+    @testset "connect errors remain retryable after timeout exclusion" begin
+        calls = Ref(0)
+        function mock(method, url, headers, body; kwargs...)
+            calls[] += 1
+            calls[] < 3 && throw(HTTP.Exceptions.ConnectError(url, ErrorException("refused")))
+            HTTP.Response(200; body = "{}")
+        end
+        c = HTTPClient("k", "https://example.test";
+                       dispatcher = mock, retry_sleep = _NOSLEEP)
+        resp = request(c, :GET, "/v0/foo")
+        @test resp.status == 200
+        @test calls[] == 3
+    end
+
+    @testset "DEFAULT_TIMEOUT raised for long-range queries" begin
+        @test DEFAULT_TIMEOUT == 600
     end
 
     @testset "request does not retry a non-transient exception" begin
