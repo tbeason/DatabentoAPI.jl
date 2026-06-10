@@ -14,6 +14,12 @@ concrete record type — roughly 10× faster decode and 60% less allocation than
 the generic path. Pass `typed=false` to force the legacy `Vector{DBN.DBNRecord}`
 return for callers that rely on the Union element type.
 
+The typed path tolerates records the gateway legitimately interleaves with the
+data: `ErrorMsg` records are logged with `@warn` (their text usually explains
+why data is missing), `SystemMsg`/`SymbolMappingMsg` are skipped quietly, and
+any other mismatched or unknown record types are skipped with one summary
+warning rather than throwing.
+
 `size_hint` lets callers who know the record-count bound (e.g. from a prior
 `get_record_count` call) pre-size the records vector exactly. The default
 heuristic over-allocates by 10–20% to avoid realloc churn under growth; an
@@ -113,6 +119,13 @@ By default, the concrete record type is inferred from `schema` (e.g.
 is used (~2× faster than generic dispatch). Pass `record_type = DBN.DBNRecord` to
 force the generic Union-typed path, or `record_type = SomeT` to override.
 
+Like [`get_range`](@ref), the typed path tolerates interleaved non-schema
+records: gateway `ErrorMsg` records are `@warn`-logged,
+`SystemMsg`/`SymbolMappingMsg` skipped quietly, and other mismatched rtypes
+skipped with a single summary warning — `f` only ever sees the schema's record
+type. (Consequently an explicitly wrong `record_type` override yields zero
+callbacks plus the summary warning rather than an error.)
+
 Returns the `DBN.Metadata` from the response header.
 """
 function foreach_record(f, c::Historical;
@@ -155,7 +168,7 @@ function foreach_record(f, c::Historical;
                 f(rec)
             end
         else
-            DBN._foreach_record_impl(f, decoder, T)
+            _foreach_typed_tolerant(f, decoder, T)
         end
         decoder.metadata
     end

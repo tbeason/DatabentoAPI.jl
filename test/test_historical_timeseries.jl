@@ -2,6 +2,7 @@ using Test
 using DatabentoAPI
 using HTTP
 using CodecZstd
+using Logging
 using TranscodingStreams
 using DatabentoBinaryEncoding
 import DatabentoBinaryEncoding as DBN
@@ -50,6 +51,63 @@ function _build_sample_dbn_zstd()
     finally
         rm(tmp_dbn; force = true)
     end
+end
+
+# Like _build_sample_dbn_zstd but for an arbitrary record vector, and with
+# *correct* hd.length values (the fixture above writes 0, which typed readers
+# ignore but the tolerant decode loop relies on to skip mismatched records by
+# header length — real gateway streams always carry correct lengths).
+function _build_dbn_zstd(records::Vector{DBN.DBNRecord})
+    metadata = DBN.Metadata(
+        DBN.DBN_VERSION,
+        "XNAS.ITCH",
+        DBN.Schema.TRADES,
+        Int64(0),
+        nothing, nothing, nothing,
+        DBN.SType.INSTRUMENT_ID,
+        false,
+        ["AAPL"], String[], String[],
+        Tuple{String,String,Int64,Int64}[],
+    )
+    tmp_dbn, tmp_io = mktemp()
+    close(tmp_io)
+    try
+        DBN.write_dbn(tmp_dbn, metadata, records)
+        raw = read(tmp_dbn)
+        return raw, transcode(ZstdCompressor, raw)
+    finally
+        rm(tmp_dbn; force = true)
+    end
+end
+
+# TradeMsg is 48 bytes on the wire → hd.length = 12 four-byte units.
+function _trade_rec(i)
+    hd = DBN.RecordHeader(
+        UInt8(12), DBN.RType.MBP_0_MSG,
+        UInt16(1), UInt32(100 + i), Int64(1_700_000_000_000_000_000 + i * 1_000_000),
+    )
+    DBN.TradeMsg(hd,
+        Int64(150_000_000_000 + i * 1_000_000), UInt32(100),
+        DBN.Action.TRADE, DBN.Side.ASK, UInt8(0), UInt8(1),
+        Int64(1_700_000_000_000_000_000 + i * 1_000_000), Int32(0), UInt32(i))
+end
+
+# Trades with a gateway ErrorMsg and SystemMsg interleaved — the shape that
+# made typed decode throw before #30. ErrorMsg payload is padded to
+# hd.length*4-16, so hd.length must cover the message text (+ null).
+function _build_mixed_dbn_zstd()
+    err_hd = DBN.RecordHeader(UInt8(16), DBN.RType.ERROR_MSG, UInt16(1), UInt32(0), Int64(0))
+    sys_hd = DBN.RecordHeader(UInt8(8), DBN.RType.SYSTEM_MSG, UInt16(1), UInt32(0), Int64(0))
+    records = DBN.DBNRecord[
+        _trade_rec(1),
+        _trade_rec(2),
+        DBN.ErrorMsg(err_hd, "partial symbol resolution"),
+        _trade_rec(3),
+        DBN.SystemMsg(sys_hd, "Heartbeat", ""),
+        _trade_rec(4),
+    ]
+    raw, compressed = _build_dbn_zstd(records)
+    return raw, compressed, 4   # 4 trades
 end
 
 @testset "historical get_range" begin
@@ -263,6 +321,75 @@ end
         dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
         start_dt = "2024-01-02T14:30:00", end_dt = "2024-01-02T14:31:00") do rec
     end
+end
+
+@testset "typed get_range tolerates interleaved control records (#30)" begin
+    _, compressed, n_trades = _build_mixed_dbn_zstd()
+    mock = (method, url, headers, body; kwargs...) -> HTTP.Response(200; body = compressed)
+    c = Historical("test-key"; gateway = "https://hist.test", dispatcher = mock)
+    store = @test_logs (:warn, r"gateway error record") match_mode=:any get_range(c;
+        dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+        start_dt = "2024-01-02T14:30:00", end_dt = "2024-01-02T14:31:00")
+    @test store.records isa Vector{DBN.TradeMsg}
+    @test length(store) == n_trades
+    @test [r.sequence for r in store] == UInt32[1, 2, 3, 4]
+end
+
+@testset "typed foreach_record tolerates interleaved control records (#30)" begin
+    _, compressed, n_trades = _build_mixed_dbn_zstd()
+    opener = _seq_opener([(200, Pair{String,String}[], compressed)])
+    c = Historical("test-key"; gateway = "https://hist.test", stream_opener = opener)
+    seen = Ref(0)
+    md = @test_logs (:warn, r"gateway error record") match_mode=:any begin
+        DatabentoAPI.foreach_record(c;
+            dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+            start_dt = "2024-01-02T14:30:00", end_dt = "2024-01-02T14:31:00") do rec
+            @test rec isa DBN.TradeMsg
+            seen[] += 1
+        end
+    end
+    @test seen[] == n_trades
+    @test md isa DBN.Metadata
+end
+
+@testset "typed decode skips unknown rtypes with a summary warn (#30)" begin
+    raw, _, n_trades = _build_mixed_dbn_zstd()
+    # Splice a fake 8-byte record (length = 2 four-byte units, rtype 0xFE)
+    # onto the end of the uncompressed stream — records are just concatenated.
+    fake = vcat(UInt8[0x02, 0xFE], zeros(UInt8, 6))
+    compressed = transcode(ZstdCompressor, vcat(raw, fake))
+    mock = (method, url, headers, body; kwargs...) -> HTTP.Response(200; body = compressed)
+    c = Historical("test-key"; gateway = "https://hist.test", dispatcher = mock)
+    store = @test_logs (:warn, r"gateway error record") (:warn, r"skipped records") get_range(c;
+        dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+        start_dt = "2024-01-02T14:30:00", end_dt = "2024-01-02T14:31:00")
+    @test length(store) == n_trades
+end
+
+@testset "wrong record_type override skips with summary warn instead of throwing (#30)" begin
+    _, compressed, n_trades = _build_mixed_dbn_zstd()
+    opener = _seq_opener([(200, Pair{String,String}[], compressed)])
+    c = Historical("test-key"; gateway = "https://hist.test", stream_opener = opener)
+    seen = Ref(0)
+    @test_logs (:warn, r"gateway error record") (:warn, r"skipped records") begin
+        DatabentoAPI.foreach_record(c;
+            dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+            start_dt = "2024-01-02T14:30:00", end_dt = "2024-01-02T14:31:00",
+            record_type = DBN.MBOMsg) do rec
+            seen[] += 1
+        end
+    end
+    @test seen[] == 0   # every trade skipped: stream rtype ≠ MBOMsg
+end
+
+@testset "pure typed stream decodes with no warnings (#30 regression)" begin
+    bytes, n = _build_sample_dbn_zstd()
+    mock = (method, url, headers, body; kwargs...) -> HTTP.Response(200; body = bytes)
+    c = Historical("test-key"; gateway = "https://hist.test", dispatcher = mock)
+    store = @test_logs min_level=Logging.Warn get_range(c;
+        dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
+        start_dt = "2024-01-02T14:30:00", end_dt = "2024-01-02T14:31:00")
+    @test length(store) == n
 end
 
 @testset "foreach_record maps read timeout → BentoTimeoutError" begin
