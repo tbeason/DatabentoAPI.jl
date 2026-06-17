@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transient statuses (429/5xx) are retried as before (#31).
 
 ### Fixed
+- **Package precompiles cleanly again.** `src/store.jl` defined the internal
+  `_foreach_typed_tolerant` helper twice (an identical copy-paste), which made
+  the module fail precompilation on Julia 1.12+ with "Method overwriting is not
+  permitted during Module precompilation". `Pkg.test` masked it by falling back
+  to no-precompile, so tests/CI stayed green while a bare `using DatabentoAPI`
+  errored. Removed the duplicate definition.
 - **Typed `get_range`/`foreach_record` no longer throw on interleaved
   non-schema records** (#30). Historical responses can legitimately carry
   gateway `ErrorMsg` (e.g. partial continuous-symbol resolution), `SystemMsg`,
