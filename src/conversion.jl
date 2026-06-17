@@ -15,8 +15,8 @@ fetched with `stype_out = SType.INSTRUMENT_ID` (the [`get_range`](@ref) default)
 any other `stype_out` leaves the column `missing` with a single warning.
 
 For streaming consumers ([`foreach_record`](@ref), which returns the
-`DBN.Metadata`), build a [`symbol_map`](@ref) once from that metadata and call
-[`symbol_for`](@ref) per record instead.
+`DBN.Metadata`), build a `symbol_map` once from that metadata and call
+`symbol_for` per record instead (both re-exported from DatabentoBinaryEncoding).
 """
 to_dataframe(s::DBNStore; symbols::Bool = false) =
     DBN.records_to_dataframe(s.records, s.metadata; symbols = symbols)
