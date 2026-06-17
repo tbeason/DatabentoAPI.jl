@@ -52,6 +52,7 @@ using URIs
 
 import DatabentoBinaryEncoding as DBN
 using DatabentoBinaryEncoding: Schema, SType, Compression, Encoding, Action, Side, InstrumentClass
+using DatabentoBinaryEncoding: symbol_map, symbol_for, add_symbol_column!
 
 include("errors.jl")
 include("enums.jl")
@@ -93,6 +94,9 @@ export load_api_key, default_config_path
 
 # Store + conversion
 export DBNStore, to_dataframe, to_csv, to_json, to_parquet, to_file
+
+# Symbol resolution (re-exported from DatabentoBinaryEncoding)
+export symbol_map, symbol_for, add_symbol_column!
 
 # Clients
 export Historical, Live

@@ -2,11 +2,24 @@
 # does not depend on DataFrames/CSV/Parquet directly — DBN.jl already pulls them in.
 
 """
-    to_dataframe(store)
+    to_dataframe(store; symbols=false)
 
-Convert a `DBNStore` to a `DataFrame` via DBN.jl's `records_to_dataframe`.
+Convert a `DBNStore` to a `DataFrame` via DBN's `records_to_dataframe`.
+
+Pass `symbols=true` to join the human-readable `raw_symbol` onto the frame as a
+`:symbol` column, resolved per record from `store.metadata.mappings` (records
+themselves carry only the opaque numeric `instrument_id`). The join keys on
+`instrument_id`/`ts_event`, follows instrument-id rolls across the query range,
+and yields `missing` for unmatched rows. It only applies when the data was
+fetched with `stype_out = SType.INSTRUMENT_ID` (the [`get_range`](@ref) default);
+any other `stype_out` leaves the column `missing` with a single warning.
+
+For streaming consumers ([`foreach_record`](@ref), which returns the
+`DBN.Metadata`), build a [`symbol_map`](@ref) once from that metadata and call
+[`symbol_for`](@ref) per record instead.
 """
-to_dataframe(s::DBNStore) = DBN.records_to_dataframe(s.records)
+to_dataframe(s::DBNStore; symbols::Bool = false) =
+    DBN.records_to_dataframe(s.records, s.metadata; symbols = symbols)
 
 """
     to_file(store, path)
