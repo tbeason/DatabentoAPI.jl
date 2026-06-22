@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transient statuses (429/5xx) are retried as before (#31).
 
 ### Fixed
+- **`User-Agent` now tracks the package version.** The default request
+  `User-Agent` was a hard-coded `DatabentoAPI.jl/0.2.0` that had to be bumped by
+  hand each release (and was already stale); it's now derived from
+  `pkgversion`, so it always matches the installed version.
 - **Package precompiles cleanly again.** `src/store.jl` defined the internal
   `_foreach_typed_tolerant` helper twice (an identical copy-paste), which made
   the module fail precompilation on Julia 1.12+ with "Method overwriting is not
