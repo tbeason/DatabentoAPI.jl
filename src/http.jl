@@ -1,4 +1,7 @@
-const USER_AGENT = "DatabentoAPI.jl/0.2.0"
+# Derived from the package version (Project.toml) so it can never drift out of
+# sync with the release — `pkgversion` returns `nothing` only when the module
+# isn't loaded as a package, in which case we fall back to a sentinel.
+const USER_AGENT = "DatabentoAPI.jl/$(something(pkgversion(@__MODULE__), v"0.0.0"))"
 # Read (inactivity) timeout. Long-range `timeseries.get_range` queries can
 # spend minutes in server-side assembly (continuous-symbol resolution +
 # day-partitioned scans) before the first byte streams, so this needs to be

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-22
+
 ### Added
 - **Symbol joining on `to_dataframe`.** `to_dataframe(store; symbols=true)` joins
   the human-readable `raw_symbol` onto the frame as a `:symbol` column, resolved
@@ -47,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transient statuses (429/5xx) are retried as before (#31).
 
 ### Fixed
+- **`User-Agent` now tracks the package version.** The default request
+  `User-Agent` was a hard-coded `DatabentoAPI.jl/0.2.0` that had to be bumped by
+  hand each release (and was already stale); it's now derived from
+  `pkgversion`, so it always matches the installed version.
 - **Package precompiles cleanly again.** `src/store.jl` defined the internal
   `_foreach_typed_tolerant` helper twice (an identical copy-paste), which made
   the module fail precompilation on Julia 1.12+ with "Method overwriting is not
@@ -269,7 +275,8 @@ Initial public release. Registered in the General registry.
   `ReconnectPolicy`, `JobState`, `SplitDuration`, `Packaging`, `Delivery`,
   `SymbologyResolution`, `RollRule`, `SlowReaderBehavior`.
 
-[Unreleased]: https://github.com/tbeason/DatabentoAPI.jl/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/tbeason/DatabentoAPI.jl/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/tbeason/DatabentoAPI.jl/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tbeason/DatabentoAPI.jl/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/tbeason/DatabentoAPI.jl/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/tbeason/DatabentoAPI.jl/compare/v0.1.0...v0.1.1
