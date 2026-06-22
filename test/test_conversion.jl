@@ -40,4 +40,30 @@ end
             @test length(recs) == 1
         end
     end
+
+    @testset "to_dataframe symbol join" begin
+        # _tiny_store's record: instrument_id=101, ts_event = 2023-11-14 (UTC),
+        # so YYYYMMDD = 20231114. Add a mapping covering that date.
+        s = _tiny_store()
+        md = DBN.Metadata(
+            s.metadata.version, s.metadata.dataset, s.metadata.schema,
+            s.metadata.start_ts, s.metadata.end_ts, s.metadata.limit,
+            s.metadata.stype_in, s.metadata.stype_out, s.metadata.ts_out,
+            s.metadata.symbols, s.metadata.partial, s.metadata.not_found,
+            [("AAPL", "101", 20231101, 20231201)],
+        )
+        store = DBNStore(md, s.records)
+
+        # off by default: no :symbol column, same frame as before
+        @test !hasproperty(to_dataframe(store), :symbol)
+
+        # on: joins the raw symbol
+        df = to_dataframe(store; symbols = true)
+        @test df.symbol == ["AAPL"]
+
+        # re-exported helpers are usable directly (e.g. for foreach_record)
+        smap = symbol_map(md)
+        @test symbol_for(smap, 101, store.records[1].hd.ts_event) == "AAPL"
+        @test symbol_for(smap, 999, store.records[1].hd.ts_event) === nothing
+    end
 end

@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Symbol joining on `to_dataframe`.** `to_dataframe(store; symbols=true)` joins
+  the human-readable `raw_symbol` onto the frame as a `:symbol` column, resolved
+  per record from `store.metadata.mappings` (records carry only the opaque
+  numeric `instrument_id`). The join follows instrument-id rolls across the query
+  range and yields `missing` for unmatched rows; it applies only when the data
+  was fetched with `stype_out = SType.INSTRUMENT_ID` (the `get_range` default).
+  The underlying helpers `symbol_map`, `symbol_for`, and `add_symbol_column!` are
+  re-exported from DatabentoBinaryEncoding for streaming consumers
+  (`foreach_record`, which returns the metadata). Requires the corresponding
+  DatabentoBinaryEncoding release.
 - **Chunked + concurrent `get_range`** (#33). New `chunk` kwarg (a
   `Dates.Period`, e.g. `Year(1)`) splits `[start_dt, end_dt)` into half-open
   chunks fetched concurrently under a semaphore (`concurrency` kwarg, default
