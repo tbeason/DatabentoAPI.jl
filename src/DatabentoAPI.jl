@@ -52,7 +52,9 @@ using URIs
 
 import DatabentoBinaryEncoding as DBN
 using DatabentoBinaryEncoding: Schema, SType, Compression, Encoding, Action, Side, InstrumentClass
-using DatabentoBinaryEncoding: symbol_map, symbol_for, add_symbol_column!
+# `import` (not `using`) so the Live client can add `symbol_map`/`symbol_for`
+# methods (extending the DBN functions) for live, current-state resolution.
+import DatabentoBinaryEncoding: symbol_map, symbol_for, add_symbol_column!
 
 include("errors.jl")
 include("enums.jl")
@@ -76,6 +78,7 @@ include("live/subscribe.jl")
 include("live/heartbeat.jl")
 include("live/streaming.jl")
 include("live/reconnect.jl")
+include("live/symbols.jl")
 
 # Re-exported DatabentoBinaryEncoding enums (single import for users)
 export Schema, SType, Compression, Encoding, Action, Side, InstrumentClass
@@ -120,5 +123,8 @@ export open_dbn_writer, write_record!
 
 # Live reconnect callback
 export add_reconnect_callback
+
+# Live symbol resolution (symbol_map / symbol_for also re-exported above)
+export add_symbol_mapping_callback
 
 end # module DatabentoAPI

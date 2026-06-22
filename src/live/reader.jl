@@ -295,6 +295,10 @@ function _reader_loop_typed(c::Live)
                         c.terminal_error = "gateway ErrorMsg"
                     end
                 end
+                # Update the symbol map before the drop decision below, so it
+                # stays correct even when control_channel overflows (a parent/
+                # continuous subscription floods SymbolMappingMsg at start).
+                rec === nothing || _record_symbol!(c, rec)
                 if rec !== nothing && ctrl_chan !== nothing && isopen(ctrl_chan)
                     # Non-blocking put. This reader is the SOLE producer to
                     # ctrl_chan (reconnect spawns readers sequentially, never
@@ -442,6 +446,9 @@ function _reader_loop(c::Live)
             # reconnect supervisor sees timestamps from records that haven't
             # been consumed yet.
             _record_replay!(c, rec)
+            # Maintain the running instrument_id → symbol map (no-op unless the
+            # record is a SymbolMappingMsg).
+            _record_symbol!(c, rec)
             # ErrorMsg sets c.terminal_error *before* the put! so the
             # supervisor sees it once the reader exits and refuses to
             # reconnect — gateway-side errors are deterministic and
