@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Live symbol resolution.** A `Live` client now keeps a running
+  `instrument_id → symbol` map, built by the reader from the gateway's
+  `SymbolMappingMsg` records. `symbol_for(client, instrument_id_or_record;
+  which=:in)` resolves the symbol for a data record (`which=:out` for the output
+  symbol), `symbol_map(client; which=:in)` returns a snapshot, and
+  `add_symbol_mapping_callback(client, cb)` fires `cb(instrument_id, msg)` on each
+  (re)mapping. Works in both typed and untyped mode and survives reconnects; in
+  typed mode the mapping is captured before any `control_channel` overflow drop,
+  so it's reliable even without draining the control channel.
+
 ## [0.3.0] - 2026-06-22
 
 ### Added

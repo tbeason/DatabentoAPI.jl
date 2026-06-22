@@ -98,6 +98,18 @@ mutable struct Live
     # gap_end in the reconnect callback.
     last_metadata_start_ns::Union{Nothing,Int64}
 
+    # Running instrument_id → SymbolMappingMsg map, built by the reader as
+    # SymbolMappingMsg records arrive. Captured in the reader *before* any
+    # control-channel drop, so it stays reliable even when control_channel
+    # overflows. Owned by the client, so it survives reconnects (the gateway
+    # re-sends mappings on re-subscribe). `symbols_lock` guards it: the reader
+    # task writes, consumer tasks read. The full record is stored so callers
+    # can resolve either the input or output symbol (and its [start,end] window).
+    symbols_by_id::Dict{UInt32,DBN.SymbolMappingMsg}
+    symbols_lock::ReentrantLock
+    # Callbacks fired on each SymbolMappingMsg: `cb(instrument_id, msg)`.
+    symbol_callbacks::Vector{Any}
+
     # Reconnect policy + retry budget.
     reconnect_policy::ReconnectPolicy.T
     max_reconnect_attempts::Union{Int,Nothing}
@@ -188,6 +200,9 @@ function Live(key::Union{Nothing,AbstractString} = nothing;
         # --- reconnect fields ---
         Dict{UInt32,Int64}(), Dict{UInt32,Int64}(),
         nothing,                                 # last_metadata_start_ns
+        Dict{UInt32,DBN.SymbolMappingMsg}(),     # symbols_by_id
+        ReentrantLock(),                         # symbols_lock
+        Any[],                                   # symbol_callbacks
         rp,
         max_reconnect_attempts === nothing ? nothing : Int(max_reconnect_attempts),
         Int(immediate_reconnect_attempts),

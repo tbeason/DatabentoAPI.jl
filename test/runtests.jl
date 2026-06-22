@@ -26,6 +26,7 @@ try
         include("test_reconnect_backoff.jl")
         include("test_live_reconnect_supervisor.jl")
         include("test_typed_mode_errors.jl")
+        include("test_live_symbols.jl")
     end
 catch e
     global offline_failed = true
