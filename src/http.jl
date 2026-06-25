@@ -82,18 +82,27 @@ HTTPClient(api_key::AbstractString, base_url::AbstractString;
 # 501 Not Implemented (a permanent "this server can't do that").
 _is_retryable_status(status::Integer) = status == 429 || (500 <= status < 600 && status != 501)
 
+# Connection-phase timeout operations (HTTP 2.x tags `TimeoutError` with the
+# phase that stalled). The `connect_timeout` budget covers DNS/dial *and* the
+# TLS handshake, so a connection failure surfaces as either `"connect"` or
+# `"tls_handshake"` — both are transient and should be treated like the old
+# `HTTP.ConnectError`, not like a read timeout.
+const _CONNECT_PHASE_TIMEOUT_OPS = ("connect", "tls_handshake")
+_is_connect_timeout(e) =
+    e isa HTTP.TimeoutError && e.operation in _CONNECT_PHASE_TIMEOUT_OPS
+
 # Transient transport-layer failures from HTTP.jl (connect/request errors).
 # Status errors don't appear here because we pass status_exception=false.
 # Read timeouts are excluded: for long-range queries the server-side assembly
 # time is deterministic, so a request that exceeded the read timeout once will
 # exceed it on every retry — retrying just multiplies the wall-clock cost by
-# (1 + max_retries) with zero success probability. Connect timeouts, by
-# contrast, are transient and stay retryable: under HTTP 2.x a connect timeout
-# surfaces as a `HTTP.TimeoutError` tagged `operation == "connect"` (no longer a
-# distinct `HTTP.ConnectError`), so we special-case it back in.
+# (1 + max_retries) with zero success probability. Connection-phase timeouts, by
+# contrast, are transient and stay retryable: under HTTP 2.x they surface as a
+# `HTTP.TimeoutError` (no longer a distinct `HTTP.ConnectError`), so we
+# special-case them back in via `_is_connect_timeout`.
 _is_retryable_exception(e) =
     (e isa HTTP.HTTPError && !(e isa HTTP.TimeoutError)) ||
-    (e isa HTTP.TimeoutError && e.operation == "connect")
+    _is_connect_timeout(e)
 
 # Parse a `Retry-After` header. The delta-seconds form is honored (capped);
 # the rarer HTTP-date form falls back to `nothing` so the caller uses backoff.
@@ -212,9 +221,9 @@ function request(c::HTTPClient, method::Symbol, path::AbstractString;
             # Read/request timeout: not retryable (see _is_retryable_exception).
             # Map to a BentoError naming the actual remedy — HTTP.jl's raw
             # TimeoutError gives no hint that it's the *client* giving up. A
-            # connect timeout (operation == "connect") is excluded: it's
-            # retryable above and not a sign the read budget was too small.
-            e isa HTTP.TimeoutError && e.operation != "connect" &&
+            # connection-phase timeout is excluded: it's retryable above and not
+            # a sign the read budget was too small.
+            e isa HTTP.TimeoutError && !_is_connect_timeout(e) &&
                 throw(BentoTimeoutError(c.timeout))
             rethrow()
         end
@@ -368,7 +377,7 @@ function open_stream(f, c::HTTPClient, path::AbstractString;
             # itself, so it is a *different* object than f_err[]. An identical
             # object means the consumer's own code threw it: propagate that
             # untouched rather than blaming the Databento stream.)
-            e isa HTTP.TimeoutError && e.operation != "connect" && e !== f_err[] &&
+            e isa HTTP.TimeoutError && !_is_connect_timeout(e) && e !== f_err[] &&
                 throw(BentoTimeoutError(c.timeout))
             rethrow()
         end
