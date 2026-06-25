@@ -124,7 +124,7 @@ const _NOSLEEP = _ -> nothing
         calls = Ref(0)
         function mock(method, url, headers, body; kwargs...)
             calls[] += 1
-            calls[] < 2 && throw(HTTP.Exceptions.ConnectError(url, ErrorException("refused")))
+            calls[] < 2 && throw(HTTP.ConnectError(url, ErrorException("refused")))
             HTTP.Response(200; body = "{}")
         end
         c = HTTPClient("k", "https://example.test";
@@ -138,7 +138,7 @@ const _NOSLEEP = _ -> nothing
         calls = Ref(0)
         function mock(method, url, headers, body; kwargs...)
             calls[] += 1
-            throw(HTTP.Exceptions.TimeoutError(100))
+            throw(HTTP.TimeoutError("read", 100))
         end
         c = HTTPClient("k", "https://example.test";
                        dispatcher = mock, retry_sleep = _NOSLEEP, timeout = 100)
@@ -162,7 +162,7 @@ const _NOSLEEP = _ -> nothing
         calls = Ref(0)
         function mock(method, url, headers, body; kwargs...)
             calls[] += 1
-            calls[] < 3 && throw(HTTP.Exceptions.ConnectError(url, ErrorException("refused")))
+            calls[] < 3 && throw(HTTP.ConnectError(url, ErrorException("refused")))
             HTTP.Response(200; body = "{}")
         end
         c = HTTPClient("k", "https://example.test";
@@ -170,6 +170,26 @@ const _NOSLEEP = _ -> nothing
         resp = request(c, :GET, "/v0/foo")
         @test resp.status == 200
         @test calls[] == 3
+    end
+
+    @testset "connection-phase timeouts (connect/tls_handshake) remain retryable" begin
+        # HTTP 2.x reports connection-phase deadline failures as TimeoutError
+        # tagged with the phase. The connect_timeout budget covers both the
+        # dial ("connect") and the TLS handshake ("tls_handshake"); both are
+        # transient and must be retried, not mapped to BentoTimeoutError.
+        for op in ("connect", "tls_handshake")
+            calls = Ref(0)
+            function mock(method, url, headers, body; kwargs...)
+                calls[] += 1
+                calls[] < 3 && throw(HTTP.TimeoutError(op, 30))
+                HTTP.Response(200; body = "{}")
+            end
+            c = HTTPClient("k", "https://example.test";
+                           dispatcher = mock, retry_sleep = _NOSLEEP)
+            resp = request(c, :GET, "/v0/foo")
+            @test resp.status == 200
+            @test calls[] == 3
+        end
     end
 
     @testset "DEFAULT_TIMEOUT raised for long-range queries" begin

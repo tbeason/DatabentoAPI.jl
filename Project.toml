@@ -1,6 +1,6 @@
 name = "DatabentoAPI"
 uuid = "feb0aed8-3291-460b-9688-521dcb17a4bf"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["Tyler Beason <tbeas12@gmail.com>"]
 
 [deps]
@@ -24,7 +24,7 @@ CodecZstd = "0.8"
 DataFrames = "1.7"
 DatabentoBinaryEncoding = "0.1.4"
 EnumX = "1.0"
-HTTP = "1.10"
+HTTP = "2.4"
 JSON3 = "1.14"
 SHA = "0.7.0"
 TOML = "1.0.3"

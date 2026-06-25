@@ -42,14 +42,16 @@ _default_http_request(method, url, headers, body; kwargs...) =
 # (`stream_opener(c, method, url, headers, qpairs) do status, headers, io ...`).
 function _default_http_stream(consume, c, method, url, headers, qpairs)
     HTTP.open(method, url, headers;
-              query = qpairs,
-              status_exception = false,
-              decompress = false,
-              retry = false,
-              readtimeout = c.timeout,
-              connect_timeout = c.connect_timeout) do http
-        HTTP.startread(http)
-        return consume(http.message.status, http.message.headers, http)
+              query             = qpairs,
+              status_exception  = false,
+              decompress        = false,
+              retries           = 0,           # HTTP 2.x: disable built-in retry (was `retry=false`)
+              read_idle_timeout = c.timeout,   # HTTP 2.x rename of `readtimeout`
+              connect_timeout   = c.connect_timeout) do http
+        # In HTTP 2.x `startread` returns the response head directly, so we read
+        # status/headers off it rather than reaching into `http.message`.
+        resp = HTTP.startread(http)
+        return consume(resp.status, resp.headers, http)
     end
 end
 
@@ -80,15 +82,27 @@ HTTPClient(api_key::AbstractString, base_url::AbstractString;
 # 501 Not Implemented (a permanent "this server can't do that").
 _is_retryable_status(status::Integer) = status == 429 || (500 <= status < 600 && status != 501)
 
+# Connection-phase timeout operations (HTTP 2.x tags `TimeoutError` with the
+# phase that stalled). The `connect_timeout` budget covers DNS/dial *and* the
+# TLS handshake, so a connection failure surfaces as either `"connect"` or
+# `"tls_handshake"` — both are transient and should be treated like the old
+# `HTTP.ConnectError`, not like a read timeout.
+const _CONNECT_PHASE_TIMEOUT_OPS = ("connect", "tls_handshake")
+_is_connect_timeout(e) =
+    e isa HTTP.TimeoutError && e.operation in _CONNECT_PHASE_TIMEOUT_OPS
+
 # Transient transport-layer failures from HTTP.jl (connect/request errors).
 # Status errors don't appear here because we pass status_exception=false.
 # Read timeouts are excluded: for long-range queries the server-side assembly
 # time is deterministic, so a request that exceeded the read timeout once will
 # exceed it on every retry — retrying just multiplies the wall-clock cost by
-# (1 + max_retries) with zero success probability. Connect timeouts surface as
-# the distinct `HTTP.ConnectError` and remain retryable.
+# (1 + max_retries) with zero success probability. Connection-phase timeouts, by
+# contrast, are transient and stay retryable: under HTTP 2.x they surface as a
+# `HTTP.TimeoutError` (no longer a distinct `HTTP.ConnectError`), so we
+# special-case them back in via `_is_connect_timeout`.
 _is_retryable_exception(e) =
-    e isa HTTP.Exceptions.HTTPError && !(e isa HTTP.Exceptions.TimeoutError)
+    (e isa HTTP.HTTPError && !(e isa HTTP.TimeoutError)) ||
+    _is_connect_timeout(e)
 
 # Parse a `Retry-After` header. The delta-seconds form is honored (capped);
 # the rarer HTTP-date form falls back to `nothing` so the caller uses backoff.
@@ -193,9 +207,9 @@ function request(c::HTTPClient, method::Symbol, path::AbstractString;
             c.dispatcher(method_str, url, headers, body_bytes;
                          query              = qpairs,
                          status_exception   = false,
-                         readtimeout        = c.timeout,
+                         read_idle_timeout  = c.timeout,        # HTTP 2.x rename of `readtimeout`
                          connect_timeout    = c.connect_timeout,
-                         retry              = false,
+                         retries            = 0,                 # HTTP 2.x: disable built-in retry (was `retry=false`)
                          decompress         = false)
         catch e
             # Transient transport failure: back off and retry until the budget
@@ -204,10 +218,13 @@ function request(c::HTTPClient, method::Symbol, path::AbstractString;
                 _retry_wait(c, attempt, nothing)
                 continue
             end
-            # Read timeout: not retryable (see _is_retryable_exception). Map to
-            # a BentoError naming the actual remedy — HTTP.jl's raw TimeoutError
-            # gives no hint that it's the *client* giving up.
-            e isa HTTP.Exceptions.TimeoutError && throw(BentoTimeoutError(c.timeout))
+            # Read/request timeout: not retryable (see _is_retryable_exception).
+            # Map to a BentoError naming the actual remedy — HTTP.jl's raw
+            # TimeoutError gives no hint that it's the *client* giving up. A
+            # connection-phase timeout is excluded: it's retryable above and not
+            # a sign the read budget was too small.
+            e isa HTTP.TimeoutError && !_is_connect_timeout(e) &&
+                throw(BentoTimeoutError(c.timeout))
             rethrow()
         end
 
@@ -238,7 +255,9 @@ Issue a GET request and parse the JSON response body via JSON3.
 """
 function get_json(c::HTTPClient, path::AbstractString; query = nothing)
     resp = request(c, :GET, path; query = query, accept = "application/json")
-    return JSON3.read(resp.body)
+    # HTTP 2.x: `resp.body` is an `HTTP.BytesBody`, not a `Vector{UInt8}`; JSON3
+    # doesn't recognize it, so materialize the bytes first.
+    return JSON3.read(Vector{UInt8}(resp.body))
 end
 
 """
@@ -248,7 +267,8 @@ Issue a POST request with a form-encoded body and parse the JSON response.
 """
 function post_json(c::HTTPClient, path::AbstractString; body = nothing)
     resp = request(c, :POST, path; body = body, accept = "application/json")
-    return JSON3.read(resp.body)
+    # HTTP 2.x: materialize the BytesBody before handing it to JSON3 (see get_json).
+    return JSON3.read(Vector{UInt8}(resp.body))
 end
 
 """
@@ -357,7 +377,7 @@ function open_stream(f, c::HTTPClient, path::AbstractString;
             # itself, so it is a *different* object than f_err[]. An identical
             # object means the consumer's own code threw it: propagate that
             # untouched rather than blaming the Databento stream.)
-            e isa HTTP.Exceptions.TimeoutError && e !== f_err[] &&
+            e isa HTTP.TimeoutError && !_is_connect_timeout(e) && e !== f_err[] &&
                 throw(BentoTimeoutError(c.timeout))
             rethrow()
         end

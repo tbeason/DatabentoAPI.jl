@@ -156,11 +156,11 @@ function batch_download(c::Historical;
              "Accept"        => "application/octet-stream",
              "User-Agent"    => c.http.user_agent],
             UInt8[];
-            status_exception = false,
-            readtimeout      = c.http.timeout,
-            connect_timeout  = c.http.connect_timeout,
-            retry            = false,
-            decompress       = false)
+            status_exception  = false,
+            read_idle_timeout = c.http.timeout,        # HTTP 2.x rename of `readtimeout`
+            connect_timeout   = c.http.connect_timeout,
+            retries           = 0,                       # HTTP 2.x: disable built-in retry (was `retry=false`)
+            decompress        = false)
         if resp.status >= 400
             T = resp.status < 500 ? BentoClientError : BentoServerError
             throw(http_error_from_response(T, resp.status,

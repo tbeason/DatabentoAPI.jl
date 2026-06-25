@@ -554,7 +554,7 @@ end
     calls = Ref(0)
     opener = (consume, c, method, url, headers, qpairs) -> begin
         calls[] += 1
-        throw(HTTP.Exceptions.TimeoutError(100))
+        throw(HTTP.TimeoutError("read", 100))
     end
     c = Historical("test-key"; gateway = "https://hist.test",
                    stream_opener = opener, retry_sleep = _NOSLEEP_TS, timeout = 100)
@@ -566,17 +566,17 @@ end
 end
 
 @testset "consumer-raised HTTP TimeoutError is not blamed on the stream" begin
-    # If the callback's own code throws HTTP.Exceptions.TimeoutError (e.g. it
-    # makes its own HTTP request), that must propagate untouched — mapping it
-    # to BentoTimeoutError would misreport the Databento stream as the culprit.
+    # If the callback's own code throws HTTP.TimeoutError (e.g. it makes its own
+    # HTTP request), that must propagate untouched — mapping it to
+    # BentoTimeoutError would misreport the Databento stream as the culprit.
     bytes, _ = _build_sample_dbn_zstd()
     opener = _seq_opener([(200, Pair{String,String}[], bytes)])
     c = Historical("test-key"; gateway = "https://hist.test",
                    stream_opener = opener, retry_sleep = _NOSLEEP_TS, timeout = 100)
-    @test_throws HTTP.Exceptions.TimeoutError DatabentoAPI.foreach_record(c;
+    @test_throws HTTP.TimeoutError DatabentoAPI.foreach_record(c;
         dataset = "XNAS.ITCH", schema = Schema.TRADES, symbols = ["AAPL"],
         start_dt = "2024-01-02T14:30:00", end_dt = "2024-01-02T14:31:00") do rec
-        throw(HTTP.Exceptions.TimeoutError(42))   # consumer's own timeout
+        throw(HTTP.TimeoutError("read", 42))   # consumer's own timeout
     end
 end
 
