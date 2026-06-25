@@ -124,7 +124,7 @@ const _NOSLEEP = _ -> nothing
         calls = Ref(0)
         function mock(method, url, headers, body; kwargs...)
             calls[] += 1
-            calls[] < 2 && throw(HTTP.Exceptions.ConnectError(url, ErrorException("refused")))
+            calls[] < 2 && throw(HTTP.ConnectError(url, ErrorException("refused")))
             HTTP.Response(200; body = "{}")
         end
         c = HTTPClient("k", "https://example.test";
@@ -138,7 +138,7 @@ const _NOSLEEP = _ -> nothing
         calls = Ref(0)
         function mock(method, url, headers, body; kwargs...)
             calls[] += 1
-            throw(HTTP.Exceptions.TimeoutError(100))
+            throw(HTTP.TimeoutError("read", 100))
         end
         c = HTTPClient("k", "https://example.test";
                        dispatcher = mock, retry_sleep = _NOSLEEP, timeout = 100)
@@ -162,7 +162,7 @@ const _NOSLEEP = _ -> nothing
         calls = Ref(0)
         function mock(method, url, headers, body; kwargs...)
             calls[] += 1
-            calls[] < 3 && throw(HTTP.Exceptions.ConnectError(url, ErrorException("refused")))
+            calls[] < 3 && throw(HTTP.ConnectError(url, ErrorException("refused")))
             HTTP.Response(200; body = "{}")
         end
         c = HTTPClient("k", "https://example.test";

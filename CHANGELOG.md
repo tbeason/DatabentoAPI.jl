@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-25
+
 ### Added
 - **Live symbol resolution.** A `Live` client now keeps a running
   `instrument_id → symbol` map, built by the reader from the gateway's
@@ -17,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (re)mapping. Works in both typed and untyped mode and survives reconnects; in
   typed mode the mapping is captured before any `control_channel` overflow drop,
   so it's reliable even without draining the control channel.
+
+### Changed
+- **Upgraded to HTTP.jl 2.4** (from 1.10). HTTP.jl 2.x is a ground-up rewrite
+  with renamed keywords and top-level exception types; the changes here are
+  internal (`readtimeout` → `read_idle_timeout`, `retry=false` → `retries=0`,
+  `HTTP.Exceptions.X` → `HTTP.X`, and using `startread`'s returned response) and
+  do not affect the public API. Connect timeouts (now surfaced as
+  `HTTP.TimeoutError(operation="connect")` rather than `HTTP.ConnectError`)
+  remain retryable, as before.
 
 ## [0.3.0] - 2026-06-22
 
