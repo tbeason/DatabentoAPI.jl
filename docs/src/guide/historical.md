@@ -160,17 +160,21 @@ job = submit_job(client;
 
 job_id = job["id"]
 
-# Poll until done
+# Poll until done — get_job_details returns the full job object for one id
 while true
-    jobs = list_jobs(client; states = [JobState.PROCESSING, JobState.DONE])
-    j = first(filter(x -> x["id"] == job_id, jobs))
-    j["state"] == "done" && break
+    get_job_details(client; job_id = job_id)["state"] == "done" && break
     sleep(30)
 end
 
 # Fetch files
 paths = batch_download(client; job_id = job_id, output_dir = "./batch_out")
 ```
+
+To survey all your jobs, `list_jobs(client; short = true)` returns just `id`,
+`state`, and `ts_received` per job. Databento is migrating `list_jobs` to that
+condensed shape (opt-in today, then the default, then the only form), so read
+every other per-job field — `record_count`, `cost_usd`, `ts_expiration`, the
+original request parameters — through [`get_job_details`](@ref).
 
 See [`submit_job`](@ref) for the full kwarg list — `split_duration`,
 `packaging`, `delivery`, etc.

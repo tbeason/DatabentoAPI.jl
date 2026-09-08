@@ -39,7 +39,7 @@ behavior is selected via the `reconnect::Bool` kwarg on
 """
     JobState
 
-State of a batch job returned by [`list_jobs`](@ref):
+State of a batch job returned by [`list_jobs`](@ref) / [`get_job_details`](@ref):
 
   - `RECEIVED` — accepted by the API.
   - `QUEUED` — waiting to start.

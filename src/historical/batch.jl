@@ -4,7 +4,7 @@
     submit_job(client; dataset, symbols, schema, start_dt, end_dt=nothing, ...) -> Dict
 
 Submit an asynchronous batch job. The Historical API queues the request and
-returns a `job_id`; poll [`list_jobs`](@ref) until the [`JobState`](@ref) is
+returns a `job_id`; poll [`get_job_details`](@ref) until the [`JobState`](@ref) is
 `DONE`, then call [`list_files`](@ref) and [`batch_download`](@ref) to fetch
 the results.
 
@@ -74,18 +74,29 @@ function submit_job(c::Historical;
 end
 
 """
-    list_jobs(client; states=nothing, since=nothing)
+    list_jobs(client; states=nothing, since=nothing, short=nothing)
 
 List batch jobs submitted under the calling API key, optionally filtered
 to one or more [`JobState`](@ref) values (`states` accepts a single state,
 a vector, or a comma-separated string) and/or to jobs created after `since`
 (`DateTime`, ISO-8601 string, or unix-ns integer). Returns a JSON array of
-job objects.
+job objects sorted by `ts_received`.
+
+`short=true` requests the condensed response — only `id`, `state`, and
+`ts_received` per job — which is all a polling loop needs. Databento is
+migrating `list_jobs` to this shape in phases (August 2026 batch API notice):
+currently the full job object is returned unless `short=true`; a later phase
+flips the server default to condensed; the final phase removes the parameter
+and the legacy response altogether. Read anything beyond those three fields
+via [`get_job_details`](@ref), not from `list_jobs`. With `short=nothing`
+(default) the parameter is omitted and the server default applies, so the
+default behavior of this function tracks Databento's rollout.
 Wraps `GET /v0/batch.list_jobs`.
 """
 function list_jobs(c::Historical;
                    states::Union{Nothing,AbstractVector,JobState.T,AbstractString} = nothing,
-                   since::Union{Nothing,DateTime,AbstractString,Integer} = nothing)
+                   since::Union{Nothing,DateTime,AbstractString,Integer} = nothing,
+                   short::Union{Nothing,Bool} = nothing)
     states_v = if states isa AbstractVector
         join((s isa JobState.T ? lowercase(String(Symbol(s))) : String(s) for s in states), ",")
     elseif states isa JobState.T
@@ -96,8 +107,24 @@ function list_jobs(c::Historical;
         nothing
     end
     return get_json(c.http, hist_path("batch.list_jobs");
-                    query = (states = states_v, since = ts_str(since)))
+                    query = (states = states_v, since = ts_str(since), short = short))
 end
+
+"""
+    get_job_details(client; job_id) -> Dict
+
+Fetch the full record for one batch job: the request parameters (`dataset`,
+`symbols`, `schema`, `start`, `end`, `encoding`, `compression`, `split_*`,
+`packaging`, `delivery`, `limit`, ...), sizing and cost (`record_count`,
+`billed_size`, `actual_size`, `package_size`, `cost_usd`), and lifecycle
+(`state`, `progress`, `ts_received`, `ts_queued`, `ts_process_start`,
+`ts_process_done`, `ts_expiration`). This is the endpoint for per-job fields
+now that [`list_jobs`](@ref) is converging on a condensed
+`id`/`state`/`ts_received` response.
+Wraps `GET /v0/batch.get_job_details`.
+"""
+get_job_details(c::Historical; job_id::AbstractString) =
+    get_json(c.http, hist_path("batch.get_job_details"); query = (; job_id = String(job_id)))
 
 """
     list_files(client; job_id)

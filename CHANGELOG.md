@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`get_job_details(client; job_id)`** wraps the new
+  `GET /v0/batch.get_job_details` endpoint and returns the full job object
+  (request parameters, `record_count`, `billed_size`, `actual_size`,
+  `package_size`, `cost_usd`, `state`, `progress`, and the `ts_*` lifecycle
+  timestamps).
+- **`list_jobs(...; short=true)`** requests the new condensed response (`id`,
+  `state`, `ts_received` only). Per Databento's August 2026 batch API notice,
+  `list_jobs` is moving to that shape in phases: `short` is opt-in today,
+  becomes the server default next, and is finally removed along with the legacy
+  full response. Code that reads any other field from `list_jobs` should switch
+  to `get_job_details`. The default `short=nothing` omits the parameter so the
+  server default applies through the transition.
+
+### Notes
+- Databento's July 2026 CME (`GLBX.MDP3`) normalization changes — one
+  definition record per strategy leg, a standalone `F_LAST` MBO record with
+  `action = NONE` / `price = UNDEF_PRICE` / `size = 0`, price-limit statistics
+  (`stat_type` 17/18), implied-matching status events, and
+  `instrument_class = X` for FX spot — need no code changes in this package:
+  record decoding is delegated to DatabentoBinaryEncoding, which handles these
+  shapes and gains `StatType`/`TradingEvent` enums, `InstrumentClass.INDEX`,
+  and `F_*` flag constants in its next release. Downstream code that builds
+  books from MBO, or keys definitions by `instrument_id`, should review the
+  notice.
+
 ## [0.3.1] - 2026-06-25
 
 ### Added
