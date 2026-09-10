@@ -96,4 +96,50 @@ using HTTP
             @test gets_called[] == 0
         end
     end
+
+    @testset "list_jobs short parameter (Aug 2026 batch API change)" begin
+        seen = Ref(Dict{String,String}())
+        function mock(method, url, headers, body; kwargs...)
+            @test method == "GET"
+            @test occursin("batch.list_jobs", url)
+            seen[] = Dict{String,String}(get(kwargs, :query, Pair{String,String}[]))
+            HTTP.Response(200; body = """[{"id":"GLBX-20220901-5DEFXVTMSM","state":"done","ts_received":"2022-09-01T00:00:00Z"}]""")
+        end
+        c = Historical("test-key"; gateway = "https://hist.test", dispatcher = mock)
+
+        # Default: parameter omitted so the server default applies through the
+        # phased rollout (full response now, condensed later).
+        list_jobs(c)
+        @test !haskey(seen[], "short")
+
+        jobs = list_jobs(c; short = true)
+        @test seen[]["short"] == "true"
+        @test jobs[1]["id"] == "GLBX-20220901-5DEFXVTMSM"
+        @test jobs[1]["state"] == "done"
+        @test jobs[1]["ts_received"] == "2022-09-01T00:00:00Z"
+
+        list_jobs(c; short = false, states = JobState.DONE)
+        @test seen[]["short"] == "false"
+        @test seen[]["states"] == "done"
+    end
+
+    @testset "get_job_details queries by job_id" begin
+        function mock(method, url, headers, body; kwargs...)
+            @test method == "GET"
+            @test occursin("batch.get_job_details", url)
+            d = Dict{String,String}(get(kwargs, :query, Pair{String,String}[]))
+            @test d["job_id"] == "GLBX-20220901-5DEFXVTMSM"
+            HTTP.Response(200; body = """{"id":"GLBX-20220901-5DEFXVTMSM","state":"done",
+                "dataset":"GLBX.MDP3","schema":"mbo","symbols":"ESM2","stype_in":"raw_symbol",
+                "record_count":12345,"billed_size":98765,"cost_usd":0.5,"progress":100,
+                "ts_received":"2022-09-01T00:00:00Z","ts_expiration":"2022-10-01T00:00:00Z"}""")
+        end
+        c = Historical("test-key"; gateway = "https://hist.test", dispatcher = mock)
+        job = get_job_details(c; job_id = "GLBX-20220901-5DEFXVTMSM")
+        @test job["id"] == "GLBX-20220901-5DEFXVTMSM"
+        @test job["state"] == "done"
+        @test job["dataset"] == "GLBX.MDP3"
+        @test job["record_count"] == 12345
+        @test job["cost_usd"] == 0.5
+    end
 end
