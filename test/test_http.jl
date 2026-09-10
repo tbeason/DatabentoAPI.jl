@@ -45,6 +45,10 @@ const _NOSLEEP = _ -> nothing
         @test_throws BentoClientError request(c, :GET, "/v0/foo")
         @test captured[].method == "GET"
         @test captured[].url == "https://example.test/v0/foo"
+        @test captured[].kwargs[:read_idle_timeout] == DEFAULT_TIMEOUT
+        @test captured[].kwargs[:retries] == 0
+        @test !haskey(captured[].kwargs, :readtimeout)
+        @test !haskey(captured[].kwargs, :retry)
         # Authorization header present
         @test any(p -> first(p) == "Authorization", captured[].headers)
     end
