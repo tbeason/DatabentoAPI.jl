@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Require DatabentoBinaryEncoding 0.1.7 so MBO decoding cannot resolve to a
-  release with the pre-0.1.7 wire-layout defect.
+- Require DatabentoBinaryEncoding 0.1.6 so MBO decoding cannot resolve to a
+  release with the pre-0.1.6 wire-layout defect.
 - Clarify that live symbol-mapping callbacks execute synchronously on the
   reader task and must return quickly.
 
