@@ -5,6 +5,35 @@ All notable changes to DatabentoAPI.jl are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-09-17
+
+### Added
+- **`get_job_details(client; job_id)`** wraps the new
+  `GET /v0/batch.get_job_details` endpoint and returns the full job object
+  (request parameters, `record_count`, `billed_size`, `actual_size`,
+  `package_size`, `cost_usd`, `state`, `progress`, and the `ts_*` lifecycle
+  timestamps).
+- **`list_jobs(...; short=true)`** requests the new condensed response (`id`,
+  `state`, `ts_received` only). Per Databento's August 2026 batch API notice,
+  `list_jobs` is moving to that shape in phases: `short` is opt-in today,
+  becomes the server default next, and is finally removed along with the legacy
+  full response. Code that reads any other field from `list_jobs` should switch
+  to `get_job_details`. The default `short=nothing` omits the parameter so the
+  server default applies through the transition.
+
+### Notes
+- Databento's July 2026 CME (`GLBX.MDP3`) normalization changes — one
+  definition record per strategy leg, a standalone `F_LAST` MBO record with
+  `action = NONE` / `price = UNDEF_PRICE` / `size = 0`, price-limit statistics
+  (`stat_type` 17/18), implied-matching status events, and
+  `instrument_class = X` for FX spot — need no code changes in this package:
+  record decoding is delegated to DatabentoBinaryEncoding, which handles these
+  shapes and gains `StatType`/`TradingEvent` enums, `InstrumentClass.INDEX`,
+  and `F_*` flag constants in its 0.1.7 release. Until this package
+  re-exports them they are reachable as `DatabentoAPI.DBN.StatType` and
+  `DatabentoAPI.DBN.TradingEvent`. Downstream code that builds books from
+  MBO, or keys definitions by `instrument_id`, should review the notice.
+
 ## [0.3.2] - 2026-09-10
 
 ### Changed
@@ -311,6 +340,9 @@ Initial public release. Registered in the General registry.
   `SymbologyResolution`, `RollRule`, `SlowReaderBehavior`.
 
 [Unreleased]: https://github.com/tbeason/DatabentoAPI.jl/compare/v0.3.0...HEAD
+[0.3.3]: https://github.com/tbeason/DatabentoAPI.jl/compare/v0.3.2...v0.3.3
+[0.3.2]: https://github.com/tbeason/DatabentoAPI.jl/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/tbeason/DatabentoAPI.jl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/tbeason/DatabentoAPI.jl/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tbeason/DatabentoAPI.jl/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/tbeason/DatabentoAPI.jl/compare/v0.1.1...v0.1.2

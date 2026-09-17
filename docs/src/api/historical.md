@@ -37,6 +37,7 @@ get_cost
 ```@docs
 submit_job
 list_jobs
+get_job_details
 list_files
 batch_download
 ```
