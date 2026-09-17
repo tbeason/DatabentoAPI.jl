@@ -164,9 +164,10 @@ end
 Perform an HTTP request against the Databento gateway. Maps 4xx → `BentoClientError`
 and 5xx → `BentoServerError`. Returns the underlying `HTTP.Messages.Response`.
 
-Transient failures — HTTP `429` (rate limit) and `5xx`, plus connection/timeout
+Transient failures — HTTP `429` (rate limit), `5xx`, and connection-phase
 errors — are retried up to `c.max_retries` times with full-jitter exponential
 backoff. A `Retry-After` response header, when present, overrides the backoff.
+Read-idle timeouts are mapped to [`BentoTimeoutError`](@ref) without retrying.
 Once the retry budget is exhausted the final response is mapped to its error as
 usual, so a persistently rate-limited request still surfaces `BentoClientError(429)`.
 

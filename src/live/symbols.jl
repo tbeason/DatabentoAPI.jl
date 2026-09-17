@@ -26,10 +26,10 @@
     return nothing
 end
 
-# Snapshot callbacks under the lock, then fire outside it so a slow callback
-# can't block the reader (mirrors _fire_reconnect_callbacks).
+# Snapshot callbacks under the lock, then fire outside it so callbacks may call
+# symbol APIs without deadlocking. Callbacks still execute synchronously on the
+# reader task and therefore must return quickly.
 function _fire_symbol_callbacks(c::Live, iid::UInt32, rec::DBN.SymbolMappingMsg)
-    isempty(c.symbol_callbacks) && return nothing
     cbs = @lock c.symbols_lock copy(c.symbol_callbacks)
     for cb in cbs
         try
@@ -104,7 +104,9 @@ time the gateway maps (or remaps) an instrument id — useful for reacting to
 continuous/parent symbol rolls or persisting the mapping. Callbacks fire from
 the reader task; they are snapshotted under a lock and run outside it, and an
 exception in a callback is logged and swallowed (it won't disrupt the reader or
-other callbacks). The map itself is updated before callbacks fire, so
+other callbacks). Callbacks execute synchronously on the live reader task, so
+they should hand off expensive or blocking work to another task. The map itself
+is updated before callbacks fire, so
 [`symbol_for`](@ref) already reflects the new mapping inside the callback.
 """
 function add_symbol_mapping_callback(c::Live, cb)
